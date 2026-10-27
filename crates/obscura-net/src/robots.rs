@@ -167,16 +167,15 @@ fn parse_robots_txt(body: &str, our_agent: &str) -> RobotsRules {
         group
             .agents
             .iter()
-            .any(|agent| agent == "*" || our_tokens.iter().any(|token| token == agent))
+            .any(|agent| agent != "*" && our_tokens.iter().any(|token| token == agent))
     };
     let specific = groups
         .iter()
-        .any(|group| matches(group) && group.agents.iter().any(|agent| agent != "*"));
+        .any(&matches);
     let mut disallowed = Vec::new();
     let mut allowed = Vec::new();
     for group in groups.iter().filter(|group| {
-        matches(group)
-            && (!specific || group.agents.iter().any(|agent| agent != "*"))
+        if specific { matches(group) } else { group.agents.iter().any(|agent| agent == "*") }
     }) {
         disallowed.extend(group.disallowed.iter().cloned());
         allowed.extend(group.allowed.iter().cloned());
@@ -258,6 +257,18 @@ mod tests {
         cache.parse_and_store("specific.test", body, "Obscura");
         assert!(cache.is_allowed("specific.test", "/elsewhere"));
         assert!(!cache.is_allowed("specific.test", "/only"));
+    }
+
+    #[test]
+    fn unrelated_agents_in_wildcard_groups_do_not_select_specific_rules() {
+        let cache = RobotsCache::new();
+        let mixed = "User-agent: *\nUser-agent: OtherBot\nDisallow: /mixed\n\n";
+        cache.parse_and_store("wildcard.test", &format!("{mixed}User-agent: *\nDisallow: /fallback\n"), "Obscura");
+        assert!(!cache.is_allowed("wildcard.test", "/mixed"));
+        assert!(!cache.is_allowed("wildcard.test", "/fallback"));
+        cache.parse_and_store("specific.test", &format!("{mixed}User-agent: Obscura\nDisallow: /own\n"), "Obscura");
+        assert!(cache.is_allowed("specific.test", "/mixed"));
+        assert!(!cache.is_allowed("specific.test", "/own"));
     }
 
     #[test]
