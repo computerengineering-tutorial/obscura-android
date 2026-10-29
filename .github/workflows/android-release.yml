@@ -30,7 +30,7 @@ jobs:
       EXTRA_GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
       # Ultra-fast target flags strictly for Android aarch64 (never applied to host proc-macros/tools):
       # ThinLTO cross-crate optimization, ARM NEON SIMD vectorization, opt-level=3, codegen-units=1, linker GC & O3
-      CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C lto=thin -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
+      CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
       # Enable compiler caching via sccache for both Rust and Clang (V8)
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
@@ -330,7 +330,7 @@ jobs:
           SCCACHE_CACHE_SIZE: 10G
           GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
           EXTRA_GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C lto=thin -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
           OBSCURA_NO_SNAPSHOT: "1"
         run: |
           mkdir -p android/app/src/main/jniLibs
