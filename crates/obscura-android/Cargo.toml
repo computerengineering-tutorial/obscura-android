@@ -1,0 +1,23 @@
+[package]
+name = "obscura-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Android JNI bindings for the Obscura headless browser engine"
+
+[lib]
+crate-type = ["cdylib"]
+name = "obscura_android"
+
+[dependencies]
+obscura = { workspace = true, features = ["api"] }
+obscura-cdp = { workspace = true }
+obscura-mcp = { workspace = true }
+obscura-browser = { workspace = true }
+jni = { version = "0.21", default-features = false }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = "0.2"
+base64 = "0.22"

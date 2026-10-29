@@ -1,0 +1,525 @@
+name: Android Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      NUM_JOBS: 2
+      LIBCLANG_PATH: /usr/lib/llvm-21/lib
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_CACHE_SIZE: 10G
+      # Disable internal Chromium Rust submodules & Temporal, provide NDK version for clean C++ V8 build
+      GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
+      EXTRA_GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
+      # Ultra-fast target flags strictly for Android aarch64 (never applied to host proc-macros/tools):
+      # ThinLTO cross-crate optimization, ARM NEON SIMD vectorization, opt-level=3, codegen-units=1, linker GC & O3
+      CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C lto=thin -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
+      # Enable compiler caching via sccache for both Rust and Clang (V8)
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      OBSCURA_NO_SNAPSHOT: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Set up Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1.6.0
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Export NDK environment
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      # ---------------- Caching Layer 1: APT Dependencies ----------------
+      - name: Restore APT packages cache
+        uses: actions/cache/restore@v6.1.0
+        id: restore-apt-cache
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/android-release.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Install build dependencies & Clang 21 (for V8 bindgen)
+        run: |
+          sudo rm -f /etc/apt/apt.conf.d/docker-clean
+          echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' | sudo tee /etc/apt/apt.conf.d/keep-cache
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-jammy-21.list
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake clang-21 libclang-21-dev lld-21 llvm-21-dev ninja-build pkg-config libglib2.0-dev unzip
+          echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> $GITHUB_ENV
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100 || true
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100 || true
+
+      # ---------------- Caching Layer 2: sccache (C/C++ & Rust Compiler Cache) ----------------
+      - name: Restore sccache directory
+        uses: actions/cache/restore@v6.1.0
+        id: restore-sccache
+        with:
+          path: ~/.cache/sccache
+          key: sccache-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            sccache-android-${{ runner.os }}-${{ github.run_id }}-
+            sccache-android-${{ runner.os }}-
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Configure sccache environment
+        run: |
+          mkdir -p ~/.cache/sccache
+          SCCACHE_BIN=$(which sccache || echo "")
+          if [ -n "$SCCACHE_BIN" ]; then
+            echo "SCCACHE=$SCCACHE_BIN" >> $GITHUB_ENV
+            echo "Configured SCCACHE=$SCCACHE_BIN"
+          fi
+
+      # ---------------- Caching Layer 3: Cargo Cache (Registry & Git) ----------------
+      - name: Restore Cargo registry and git cache
+        uses: actions/cache/restore@v6.1.0
+        id: restore-cargo-registry
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      # ---------------- Caching Layer 4: cargo-ndk Binary Cache ----------------
+      - name: Restore cargo-ndk binary cache
+        uses: actions/cache/restore@v6.1.0
+        id: cache-cargo-ndk
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: ${{ runner.os }}-cargo-ndk-v4
+
+      - name: Install cargo-ndk (if not cached)
+        run: which cargo-ndk >/dev/null 2>&1 || env -u RUSTFLAGS -u CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS cargo install cargo-ndk --locked
+
+      # ---------------- Caching Layer 5: V8 ICU Data Cache ----------------
+      - name: Restore V8 ICU data file cache
+        uses: actions/cache/restore@v6.1.0
+        id: cache-v8-icu
+        with:
+          path: ~/.cache/obscura-v8-icu
+          key: v8-150-icudtl-dat-ee5f27a-v2
+
+      - name: Download V8 ICU data
+        run: |
+          mkdir -p ~/.cache/obscura-v8-icu
+          if [ ! -s ~/.cache/obscura-v8-icu/icudtl.dat ]; then
+            echo "Downloading V8 common icudtl.dat (~11MB)..."
+            curl -fsSL "https://chromium.googlesource.com/chromium/deps/icu/+/ee5f27adc28bd3f15b2c293f726d14d2e336cbd5/common/icudtl.dat?format=TEXT" | base64 -d > ~/.cache/obscura-v8-icu/icudtl.dat
+          fi
+          if [ ! -s ~/.cache/obscura-v8-icu/icudtl_android.dat ]; then
+            echo "Downloading V8 Android icudtl.dat (~9MB)..."
+            curl -fsSL "https://chromium.googlesource.com/chromium/deps/icu/+/ee5f27adc28bd3f15b2c293f726d14d2e336cbd5/android/icudtl.dat?format=TEXT" | base64 -d > ~/.cache/obscura-v8-icu/icudtl_android.dat || cp ~/.cache/obscura-v8-icu/icudtl.dat ~/.cache/obscura-v8-icu/icudtl_android.dat
+          fi
+          test -s ~/.cache/obscura-v8-icu/icudtl.dat
+          test -s ~/.cache/obscura-v8-icu/icudtl_android.dat
+          ls -lh ~/.cache/obscura-v8-icu/
+
+      # ---------------- Caching Layer 6: V8 Host Sysroot Cache ----------------
+      - name: Restore Debian bullseye amd64 sysroot cache
+        uses: actions/cache/restore@v6.1.0
+        id: cache-v8-sysroot
+        with:
+          path: ~/.cache/debian_bullseye_amd64-sysroot
+          key: debian-bullseye-amd64-sysroot-v1
+
+      # ---------------- Caching Layer 6.5: Prebuilt V8 Android Binaries ----------------
+      - name: Restore Prebuilt V8 Android binaries cache
+        uses: actions/cache/restore@v6.1.0
+        id: cache-v8-prebuilt
+        with:
+          path: ~/.cache/obscura-v8-prebuilt
+          key: v8-prebuilt-v150.4.0-aarch64-linux-android-r26d-v2
+          restore-keys: |
+            v8-prebuilt-v150.4.0-aarch64-linux-android-
+
+      - name: Check and prepare prebuilt V8 binaries
+        run: |
+          mkdir -p ~/.cache/obscura-v8-prebuilt
+          ARCHIVE_FILE="$HOME/.cache/obscura-v8-prebuilt/librusty_v8_release_aarch64-linux-android.a.gz"
+          BINDING_FILE="$HOME/.cache/obscura-v8-prebuilt/src_binding_release_aarch64-linux-android.rs"
+          if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
+            echo "✅ Prebuilt V8 binaries restored from GitHub Actions cache!"
+          else
+            echo "Checking if prebuilt V8 is published in GitHub Releases..."
+            V8_RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v8-android-v150.4.0"
+            if curl -fsSL -I "$V8_RELEASE_URL/librusty_v8_release_aarch64-linux-android.a.gz" >/dev/null 2>&1; then
+              echo "Downloading prebuilt V8 archive from $V8_RELEASE_URL..."
+              curl -fsSL "$V8_RELEASE_URL/librusty_v8_release_aarch64-linux-android.a.gz" -o "$ARCHIVE_FILE"
+              curl -fsSL "$V8_RELEASE_URL/src_binding_release_aarch64-linux-android.rs" -o "$BINDING_FILE"
+              echo "✅ Successfully downloaded prebuilt V8 from GitHub Release!"
+            else
+              echo "ℹ️ Prebuilt V8 not found in cache or release; will build from source."
+            fi
+          fi
+          ls -lh ~/.cache/obscura-v8-prebuilt/ || true
+
+      - name: Fetch crate dependencies, configure V8 for target, and inject ICU data
+        run: |
+          cargo fetch --target aarch64-linux-android
+
+          # Unpack v8 and deno_core crates from cache if not already unpacked
+          for crate in $(find ~/.cargo/registry/cache/ -name "v8-150*.crate" 2>/dev/null); do
+            src_dir="${crate%/cache/*}/src/${crate##*/cache/}"
+            src_dir="${src_dir%/*}/v8-150.4.0"
+            mkdir -p "$src_dir"
+            tar -xzf "$crate" -C "$src_dir" --strip-components=1 2>/dev/null || true
+          done
+          for crate in $(find ~/.cargo/registry/cache/ -name "deno_core-0.412*.crate" 2>/dev/null); do
+            src_dir="${crate%/cache/*}/src/${crate##*/cache/}"
+            src_dir="${src_dir%/*}/deno_core-0.412.0"
+            mkdir -p "$src_dir"
+            tar -xzf "$crate" -C "$src_dir" --strip-components=1 2>/dev/null || true
+          done
+
+          # Patch v8 and deno_core crates for Android cross-compilation
+          for v8_dir in $(find ~/.cargo/registry/src/ -type d -name "v8-*" 2>/dev/null); do
+            p="$v8_dir/build.rs"
+            if [ -f "$p" ]; then
+              sed -z -i 's@fn static_lib_url() -> String {\n  if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {\n    return custom_archive;\n  }@fn static_lib_url() -> String {\n  let target = env::var("TARGET").unwrap_or_default();\n  let host = env::var("HOST").unwrap_or_default();\n  if target != host || target.contains("android") {\n    if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {\n      return custom_archive;\n    }\n  }@' "$p"
+              sed -z -i 's@fn print_prebuilt_src_binding_path() {\n  if let Ok(binding) = env::var("RUSTY_V8_SRC_BINDING_PATH") {\n    println!("cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={binding}");\n    return;\n  }@fn print_prebuilt_src_binding_path() {\n  let target = env::var("TARGET").unwrap_or_default();\n  let host = env::var("HOST").unwrap_or_default();\n  if target != host || target.contains("android") {\n    if let Ok(binding) = env::var("RUSTY_V8_SRC_BINDING_PATH") {\n      println!("cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={binding}");\n      return;\n    }\n  }@' "$p"
+            fi
+          done
+          for deno_dir in $(find ~/.cargo/registry/src/ -type d -name "deno_core-*" 2>/dev/null); do
+            p="$deno_dir/uv_compat/tty.rs"
+            if [ -f "$p" ]; then
+              sed -i '/#\[cfg(not(any(target_os = "macos", target_os = "linux")))\]/c\  #[cfg(target_os = "android")]\n  fn errno_location() -> *mut c_int {\n    unsafe extern "C" {\n      fn __errno() -> *mut c_int;\n    }\n    unsafe { __errno() }\n  }\n\n  #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]' "$p"
+            fi
+          done
+
+          # Skip heavy C++ V8 tree patching and sysroot download if prebuilt V8 is ready
+          ARCHIVE_FILE="$HOME/.cache/obscura-v8-prebuilt/librusty_v8_release_aarch64-linux-android.a.gz"
+          BINDING_FILE="$HOME/.cache/obscura-v8-prebuilt/src_binding_release_aarch64-linux-android.rs"
+          if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
+            echo "⚡ Prebuilt V8 archive is present! Skipping heavy C++ V8 tree patching and sysroot setup."
+            exit 0
+          fi
+          for v8_dir in $(find ~/.cargo/registry/src/ -type d -name "v8-*" 2>/dev/null); do
+            echo "Configuring V8 in $v8_dir"
+
+            # 1. Inject ICU data files (common for host, android for target)
+            mkdir -p "$v8_dir/third_party/icu/common" "$v8_dir/third_party/icu/android"
+            cp ~/.cache/obscura-v8-icu/icudtl.dat "$v8_dir/third_party/icu/common/icudtl.dat"
+            if [ -s ~/.cache/obscura-v8-icu/icudtl_android.dat ]; then
+              cp ~/.cache/obscura-v8-icu/icudtl_android.dat "$v8_dir/third_party/icu/android/icudtl.dat"
+            else
+              cp ~/.cache/obscura-v8-icu/icudtl.dat "$v8_dir/third_party/icu/android/icudtl.dat"
+            fi
+            test -s "$v8_dir/third_party/icu/common/icudtl.dat"
+            test -s "$v8_dir/third_party/icu/android/icudtl.dat"
+            echo "Injected icudtl.dat into $v8_dir/third_party/icu/{common,android}/"
+
+            # 2. Symlink Android NDK so:
+            # - GN finds third_party/android_toolchain/ndk
+            # - rusty_v8 build.rs finds third_party/android_ndk and skips downloading 800MB NDK
+            mkdir -p "$v8_dir/third_party/android_toolchain"
+            ln -sfn "$ANDROID_NDK_HOME" "$v8_dir/third_party/android_toolchain/ndk"
+            ln -sfn "$ANDROID_NDK_HOME" "$v8_dir/third_party/android_ndk"
+
+            # 3. Create dummy third_party directories so build.rs skips git cloning catapult (8000+ files)
+            mkdir -p "$v8_dir/third_party/android_platform"
+            mkdir -p "$v8_dir/third_party/catapult"
+
+            # 4. Patch build/config/android/BUILD.gn so android_ndk_version is always defined
+            if [ -f "$v8_dir/build/config/android/BUILD.gn" ]; then
+              if ! grep -q "android_ndk_version =" "$v8_dir/build/config/android/BUILD.gn"; then
+                echo "Patching android_ndk_version in $v8_dir/build/config/android/BUILD.gn"
+                sed -i '1s/^/if (!defined(android_ndk_version)) { android_ndk_version = "r26d" }\nif (!defined(android_ndk_root)) { android_ndk_root = "\/\/third_party\/android_toolchain\/ndk" }\n/' "$v8_dir/build/config/android/BUILD.gn"
+              fi
+            fi
+
+            # 5. Disable test_runner_py in v8/tools/BUILD.gn so catapult and test harnesses are not requested
+            if [ -f "$v8_dir/v8/tools/BUILD.gn" ]; then
+              if ! grep -q 'group("v8_testrunner")' "$v8_dir/v8/tools/BUILD.gn" 2>/dev/null; then
+                echo "Restoring pristine v8/tools/BUILD.gn from crate archive..."
+                for crate in $(find ~/.cargo/registry/cache/ -name "v8-150*.crate" 2>/dev/null); do
+                  tar -xzf "$crate" -C "$v8_dir" --strip-components=1 2>/dev/null || true
+                done
+              fi
+              echo "Disabling android test runner in $v8_dir/v8/tools/BUILD.gn"
+              python3 -c "import re; p = '$v8_dir/v8/tools/BUILD.gn'; s = open(p).read(); open(p, 'w').write(re.sub(r'group\(\"v8_android_test_runner_deps\"\)\s*\{[\s\S]*?(?=\ngroup\(\"v8_testrunner\"\))', 'group(\"v8_android_test_runner_deps\") {\n  testonly = true\n}\n', s))"
+              test -s "$v8_dir/v8/tools/BUILD.gn"
+            fi
+
+            # 6. Create stub pydeps files so GN never fails on missing Chromium python test scripts
+            mkdir -p "$v8_dir/build/android/pylib/results/presentation" "$v8_dir/build/android/test_wrapper"
+            touch "$v8_dir/build/android/pylib/results/presentation/test_results_presentation.pydeps" \
+                  "$v8_dir/build/android/devil_chromium.pydeps" \
+                  "$v8_dir/build/android/apk_operations.pydeps" \
+                  "$v8_dir/build/android/test_runner.pydeps" \
+                  "$v8_dir/build/android/test_wrapper/logdog_wrapper.pydeps" \
+                  "$v8_dir/build/android/resource_sizes.pydeps"
+
+            # 7. Install or restore Debian Bullseye amd64 sysroot for host toolchain (mksnapshot)
+            mkdir -p "$v8_dir/build/linux"
+            if [ -d ~/.cache/debian_bullseye_amd64-sysroot ]; then
+              echo "Restoring cached Debian amd64 sysroot..."
+              cp -a ~/.cache/debian_bullseye_amd64-sysroot "$v8_dir/build/linux/"
+            else
+              echo "Installing Debian amd64 sysroot via install-sysroot.py..."
+              python3 "$v8_dir/build/linux/sysroot_scripts/install-sysroot.py" --arch=amd64
+              mkdir -p ~/.cache
+              cp -a "$v8_dir/build/linux/debian_bullseye_amd64-sysroot" ~/.cache/
+            fi
+            test -d "$v8_dir/build/linux/debian_bullseye_amd64-sysroot"
+          done
+
+      # ---------------- Caching Layer 6.6: Ninja Incremental Build Tree (Resume Support) ----------------
+      # ---------------- Caching Layer 6.6: Target Build Directory (Ninja & Cargo Resume Support) ----------------
+      - name: Restore target build cache (Resume support)
+        uses: actions/cache/restore@v6.1.0
+        id: restore-target-build
+        with:
+          path: target
+          key: cargo-target-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            cargo-target-${{ runner.os }}-${{ github.run_id }}-
+            cargo-target-${{ runner.os }}-
+
+      # ---------------- Build Obscura Android JNI Library ----------------
+      - name: Build Obscura Android JNI library (.so)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          LIBCLANG_PATH: /usr/lib/llvm-21/lib
+          SCCACHE_DIR: /home/runner/.cache/sccache
+          SCCACHE_CACHE_SIZE: 10G
+          GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
+          EXTRA_GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C lto=thin -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
+          OBSCURA_NO_SNAPSHOT: "1"
+        run: |
+          mkdir -p android/app/src/main/jniLibs
+          # Ensure any stale host libv8 build artifacts from previous failed runs are cleaned
+          rm -rf target/release/deps/libv8* target/release/build/v8-* target/release/build/obscura-js-*
+          PREBUILT_DIR="$HOME/.cache/obscura-v8-prebuilt"
+          ARCHIVE_FILE="$PREBUILT_DIR/librusty_v8_release_aarch64-linux-android.a.gz"
+          BINDING_FILE="$PREBUILT_DIR/src_binding_release_aarch64-linux-android.rs"
+
+          if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
+            echo "⚡ ========================================================"
+            echo "⚡ Using prebuilt V8 Android binaries! (Ultra-Fast Mode)"
+            echo "⚡ Archive: $ARCHIVE_FILE"
+            echo "⚡ Binding: $BINDING_FILE"
+            echo "⚡ ========================================================"
+            export RUSTY_V8_ARCHIVE="$ARCHIVE_FILE"
+            export RUSTY_V8_SRC_BINDING_PATH="$BINDING_FILE"
+            unset V8_FROM_SOURCE
+          else
+            echo "⚠️ ========================================================"
+            echo "⚠️ No prebuilt V8 archive found. Compiling V8 from source."
+            echo "⚠️ ========================================================"
+            export V8_FROM_SOURCE=1
+          fi
+
+          # Native Ninja status format streamed via Cargo very-verbose mode (-vv)
+          export NINJA_STATUS="[%f/%t (%p)] "
+
+          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p obscura-android -vv
+
+          # If built from source and not yet cached, save artifacts for future runs
+          if [ ! -s "$ARCHIVE_FILE" ]; then
+            echo "Caching compiled V8 static library and bindings..."
+            mkdir -p "$PREBUILT_DIR"
+            V8_LIB="$(find target/ -name "librusty_v8.a" 2>/dev/null | head -n 1)"
+            V8_BIND="$(find target/ -name "src_binding.rs" 2>/dev/null | head -n 1)"
+            if [ -n "$V8_LIB" ] && [ -f "$V8_LIB" ]; then
+              echo "Compressing $V8_LIB -> $ARCHIVE_FILE"
+              gzip -9 -c "$V8_LIB" > "$ARCHIVE_FILE"
+            fi
+            if [ -n "$V8_BIND" ] && [ -f "$V8_BIND" ]; then
+              echo "Copying $V8_BIND -> $BINDING_FILE"
+              cp "$V8_BIND" "$BINDING_FILE"
+            fi
+            ls -lh "$PREBUILT_DIR" || true
+          fi
+
+      - name: Verify native library
+        run: |
+          test -f android/app/src/main/jniLibs/arm64-v8a/libobscura_android.so
+          ls -lh android/app/src/main/jniLibs/arm64-v8a/libobscura_android.so
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      # ---------------- Heavy Persistence: Save Caches Even If Cancelled Or Failed ----------------
+      - name: Prepare directories and stop sccache
+        if: always()
+        run: |
+          sccache --stop-server || true
+          mkdir -p target ~/.cache/sccache ~/.cache/obscura-v8-prebuilt ~/.cargo/bin ~/.cargo/registry/cache ~/.cargo/registry/index ~/.cargo/git/db
+
+      - name: Save cargo-ndk binary cache
+        uses: actions/cache/save@v6.1.0
+        if: always() && steps.cache-cargo-ndk.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cargo/bin/cargo-ndk
+          key: ${{ runner.os }}-cargo-ndk-v4
+
+      - name: Save V8 ICU data file cache
+        uses: actions/cache/save@v6.1.0
+        if: always() && steps.cache-v8-icu.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/obscura-v8-icu
+          key: v8-150-icudtl-dat-ee5f27a-v2
+
+      - name: Save Debian bullseye amd64 sysroot cache
+        uses: actions/cache/save@v6.1.0
+        if: always() && steps.cache-v8-sysroot.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/debian_bullseye_amd64-sysroot
+          key: debian-bullseye-amd64-sysroot-v1
+
+      - name: Save APT packages cache
+        uses: actions/cache/save@v6.1.0
+        if: always() && steps.restore-apt-cache.outputs.cache-hit != 'true'
+        with:
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/android-release.yml') }}
+
+      - name: Package prebuilt V8 archive (if newly built)
+        if: always()
+        run: |
+          mkdir -p ~/.cache/obscura-v8-prebuilt
+          ARCHIVE_FILE="$HOME/.cache/obscura-v8-prebuilt/librusty_v8_release_aarch64-linux-android.a.gz"
+          BINDING_FILE="$HOME/.cache/obscura-v8-prebuilt/src_binding_release_aarch64-linux-android.rs"
+          if [ ! -s "$ARCHIVE_FILE" ]; then
+            V8_LIB="$(find target/ -name "librusty_v8.a" 2>/dev/null | head -n 1)"
+            V8_BIND="$(find target/ -name "src_binding.rs" 2>/dev/null | head -n 1)"
+            if [ -n "$V8_LIB" ] && [ -f "$V8_LIB" ]; then
+              echo "Compressing $V8_LIB -> $ARCHIVE_FILE"
+              gzip -9 -c "$V8_LIB" > "$ARCHIVE_FILE"
+            fi
+            if [ -n "$V8_BIND" ] && [ -f "$V8_BIND" ]; then
+              echo "Copying $V8_BIND -> $BINDING_FILE"
+              cp "$V8_BIND" "$BINDING_FILE"
+            fi
+          fi
+          ls -lh ~/.cache/obscura-v8-prebuilt/ || true
+
+      - name: Save prebuilt V8 cache
+        uses: actions/cache/save@v6.1.0
+        if: always()
+        with:
+          path: ~/.cache/obscura-v8-prebuilt
+          key: v8-prebuilt-v150.4.0-aarch64-linux-android-r26d-v2-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save target build cache (Resume support on cancel or failure)
+        uses: actions/cache/save@v6.1.0
+        if: success()
+        with:
+          path: target
+          key: cargo-target-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save sccache directory (Compiler objects on failure/cancel)
+        uses: actions/cache/save@v6.1.0
+        if: always()
+        with:
+          path: ~/.cache/sccache
+          key: sccache-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save Cargo registry and git cache
+        uses: actions/cache/save@v6.1.0
+        if: always()
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload prebuilt V8 cache artifact
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: obscura-v8-prebuilt-android
+          path: ~/.cache/obscura-v8-prebuilt/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # ---------------- Caching Layer 7: Gradle Cache & Build APK ----------------
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6.4.1
+        with:
+          cache-read-only: false
+
+      - name: Build Android APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Stage APK for distribution
+        run: |
+          mkdir -p dist
+          APK_PATH=$(find android/app/build/outputs/apk/debug/ -name "*.apk" 2>/dev/null | head -n 1)
+          if [ -z "$APK_PATH" ]; then
+            APK_PATH=$(find android/app/build/outputs/apk/ -name "*.apk" | head -n 1)
+          fi
+          if [ -n "$APK_PATH" ]; then
+            cp "$APK_PATH" dist/obscura-android-arm64-v8a.apk
+            echo "Staged APK at dist/obscura-android-arm64-v8a.apk"
+            ls -lh dist/obscura-android-arm64-v8a.apk
+          else
+            echo "Error: No APK found in build outputs!" >&2
+            exit 1
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: obscura-android-apk
+          path: dist/obscura-android-arm64-v8a.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: dist/obscura-android-arm64-v8a.apk

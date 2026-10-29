@@ -1,0 +1,41 @@
+<resources>
+    <string name="app_name">Obscura</string>
+    <string name="engine_title">Obscura</string>
+    <string name="engine_subtitle">Headless Rust Engine • V8 Runtime • CDP • MCP</string>
+    
+    <!-- CDP Strings -->
+    <string name="cdp_header">Chrome DevTools Protocol (CDP)</string>
+    <string name="start_cdp">Start CDP</string>
+    <string name="stop_cdp">Stop CDP</string>
+    <string name="cdp_status_stopped">CDP: Stopped</string>
+    <string name="cdp_status_running">CDP: Running on port %d</string>
+    <string name="copy_cdp_ws">Copy WS URL</string>
+    <string name="enter_port_hint">Port (9222)</string>
+
+    <!-- MCP Strings -->
+    <string name="mcp_header">Model Context Protocol (MCP)</string>
+    <string name="start_mcp">Start MCP</string>
+    <string name="stop_mcp">Stop MCP</string>
+    <string name="mcp_status_stopped">MCP: Stopped</string>
+    <string name="mcp_status_running">MCP: Running on port %d</string>
+    <string name="copy_mcp_sse">Copy SSE URL</string>
+    <string name="enter_mcp_port_hint">Port (8080)</string>
+
+    <!-- Web Automation Strings -->
+    <string name="browser_header">Web Engine &amp; Extraction</string>
+    <string name="enter_url_hint">Enter target URL (e.g. https://example.com)</string>
+    <string name="mode_html">HTML</string>
+    <string name="mode_markdown">Markdown</string>
+    <string name="mode_text">Text</string>
+    <string name="mode_js">JS Eval</string>
+    <string name="stealth_label">Stealth Mode (Anti-bot bypass)</string>
+    <string name="settle_hint">Settle (ms)</string>
+    <string name="enter_script_hint">Enter JavaScript (e.g. document.title)</string>
+    <string name="execute_button">Run Obscura</string>
+
+    <!-- Output Strings -->
+    <string name="output_header">Output &amp; Inspector</string>
+    <string name="output_placeholder">Ready. Select an action or run the engine.</string>
+    <string name="copy_output">Copy</string>
+    <string name="clear_output">Clear</string>
+</resources>

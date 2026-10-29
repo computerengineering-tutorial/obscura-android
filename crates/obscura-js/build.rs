@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(obscura_external_bootstrap)");
+    println!("cargo:rustc-check-cfg=cfg(obscura_no_snapshot)");
     println!("cargo:rerun-if-changed=js/bootstrap.js");
     println!("cargo:rerun-if-changed=js/indexed_db.js");
     println!("cargo:rerun-if-changed=build.rs");
@@ -18,6 +19,29 @@ fn main() {
     let bootstrap_source = include_str!("js/bootstrap.js")
         .replace("/* INDEXED_DB */", include_str!("js/indexed_db.js"));
     let bootstrap_js = bootstrap_source.as_str();
+
+    // Always emit the combined bootstrap source for runtime execution fallback.
+    std::fs::write(out_dir.join("obscura_bootstrap_full.js"), &bootstrap_source)
+        .expect("Failed to write combined bootstrap JS source");
+
+    // Environment variable to explicitly skip snapshot generation (e.g. for Android or embedded targets).
+    let env_no_snapshot = std::env::var("OBSCURA_NO_SNAPSHOT")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
+    let is_android = target.contains("android");
+
+    if env_no_snapshot || (is_cross && is_android) {
+        eprintln!(
+            "[obscura-js build.rs] Skipping V8 snapshot creation for target={target} (OBSCURA_NO_SNAPSHOT={env_no_snapshot}, is_android={is_android})"
+        );
+        std::fs::write(&snapshot_path, b"").expect("Failed to write empty snapshot");
+        println!("cargo:rustc-cfg=obscura_no_snapshot");
+        println!(
+            "cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}",
+            snapshot_path.display()
+        );
+        return;
+    }
 
     if is_cross {
         // Cross-compilation: the host V8 (linked into this build script) produces
@@ -55,10 +79,18 @@ fn main() {
                 p
             }
             None => {
-                // Fallback: use host V8 (will produce wrong-arch snapshot).
-                eprintln!("[obscura-js build.rs] WARNING: cross-mksnapshot not found, falling back to host V8 snapshot");
-                eprintln!("[obscura-js build.rs] The snapshot may crash on the target device!");
-                generate_host_snapshot(bootstrap_js, &snapshot_path);
+                // Fallback: When cross-mksnapshot is absent, do NOT generate a host snapshot
+                // that will crash on the target. Instead, write an empty snapshot and let
+                // Obscura runtime execute bootstrap.js at isolate initialization.
+                eprintln!(
+                    "[obscura-js build.rs] WARNING: cross-mksnapshot not found for {target}; falling back to runtime bootstrap execution"
+                );
+                std::fs::write(&snapshot_path, b"").expect("Failed to write empty snapshot");
+                println!("cargo:rustc-cfg=obscura_no_snapshot");
+                println!(
+                    "cargo:rustc-env=OBSCURA_SNAPSHOT_PATH={}",
+                    snapshot_path.display()
+                );
                 return;
             }
         };

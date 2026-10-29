@@ -44,6 +44,7 @@ impl obscura_render::CanvasSurfaceSource for RuntimeCanvasSurfaceSource<'_> {
 }
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
+const BOOTSTRAP_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/obscura_bootstrap_full.js"));
 
 /// Serialize first initialization (#430), then allow two snapshot restorations
 /// at a time. Unbounded construction increases CPU and peak memory contention.
@@ -681,8 +682,9 @@ impl ObscuraJsRuntime {
                 deno_core::v8::icu::set_default_locale("en-US");
             }
 
+            let has_snapshot = !SNAPSHOT.is_empty();
             let mut runtime = JsRuntime::new(RuntimeOptions {
-                extensions: if cfg!(obscura_external_bootstrap) {
+                extensions: if cfg!(obscura_external_bootstrap) && has_snapshot {
                     vec![deno_core::Extension {
                         name: "obscura_bootstrap",
                         ..Default::default()
@@ -691,7 +693,7 @@ impl ObscuraJsRuntime {
                     vec![build_extension()]
                 },
                 module_loader: Some(module_loader),
-                startup_snapshot: Some(SNAPSHOT),
+                startup_snapshot: if has_snapshot { Some(SNAPSHOT) } else { None },
                 ..Default::default()
             });
 
@@ -702,6 +704,12 @@ impl ObscuraJsRuntime {
                 // Empty until a frame realm exists, which is what keeps the
                 // lookup free for pages that have no frames.
                 op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+            }
+
+            if !has_snapshot {
+                runtime
+                    .execute_script("<obscura:bootstrap>", BOOTSTRAP_SOURCE.to_string())
+                    .expect("runtime bootstrap execution failed");
             }
 
             let isolate_handle = runtime.v8_isolate().thread_safe_handle();
@@ -787,6 +795,31 @@ impl ObscuraJsRuntime {
                     0,
                     deno_core::v8::ContextOptions::default(),
                 )
+            })
+            .or_else(|| {
+                let ctx = deno_core::v8::Context::new(scope, deno_core::v8::ContextOptions::default());
+                let context_scope = &mut deno_core::v8::ContextScope::new(scope, ctx);
+                if let Some(src) = deno_core::v8::String::new(context_scope, BOOTSTRAP_SOURCE) {
+                    if let Some(origin) = deno_core::v8::String::new(context_scope, "<obscura:bootstrap-realm>") {
+                        let script_origin = deno_core::v8::ScriptOrigin::new(
+                            context_scope,
+                            origin.into(),
+                            0,
+                            0,
+                            false,
+                            0,
+                            None,
+                            false,
+                            false,
+                            false,
+                            None,
+                        );
+                        if let Some(script) = deno_core::v8::Script::compile(context_scope, src, Some(&script_origin)) {
+                            script.run(context_scope);
+                        }
+                    }
+                }
+                Some(ctx)
             })?;
             deno_core::v8::Global::new(scope, context)
         };
