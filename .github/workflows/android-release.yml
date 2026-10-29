@@ -32,7 +32,6 @@ jobs:
       # ThinLTO cross-crate optimization, ARM NEON SIMD vectorization, opt-level=3, codegen-units=1, linker GC & O3
       CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
       # Enable compiler caching via sccache for both Rust and Clang (V8)
-      SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: "sccache"
       OBSCURA_NO_SNAPSHOT: "1"
 
@@ -120,7 +119,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ github.run_id }}
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-registry-${{ runner.os }}-
 
@@ -307,18 +306,6 @@ jobs:
             test -d "$v8_dir/build/linux/debian_bullseye_amd64-sysroot"
           done
 
-      # ---------------- Caching Layer 6.6: Ninja Incremental Build Tree (Resume Support) ----------------
-      # ---------------- Caching Layer 6.6: Target Build Directory (Ninja & Cargo Resume Support) ----------------
-      - name: Restore target build cache (Resume support)
-        uses: actions/cache/restore@v6.1.0
-        id: restore-target-build
-        with:
-          path: target
-          key: cargo-target-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            cargo-target-${{ runner.os }}-${{ github.run_id }}-
-            cargo-target-${{ runner.os }}-
-
       # ---------------- Build Obscura Android JNI Library ----------------
       - name: Build Obscura Android JNI library (.so)
         env:
@@ -359,24 +346,9 @@ jobs:
           # Native Ninja status format streamed via Cargo very-verbose mode (-vv)
           export NINJA_STATUS="[%f/%t (%p)] "
 
-          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p obscura-android -vv
-
-          # If built from source and not yet cached, save artifacts for future runs
-          if [ ! -s "$ARCHIVE_FILE" ]; then
-            echo "Caching compiled V8 static library and bindings..."
-            mkdir -p "$PREBUILT_DIR"
-            V8_LIB="$(find target/ -name "librusty_v8.a" 2>/dev/null | head -n 1)"
-            V8_BIND="$(find target/ -name "src_binding.rs" 2>/dev/null | head -n 1)"
-            if [ -n "$V8_LIB" ] && [ -f "$V8_LIB" ]; then
-              echo "Compressing $V8_LIB -> $ARCHIVE_FILE"
-              gzip -9 -c "$V8_LIB" > "$ARCHIVE_FILE"
-            fi
-            if [ -n "$V8_BIND" ] && [ -f "$V8_BIND" ]; then
-              echo "Copying $V8_BIND -> $BINDING_FILE"
-              cp "$V8_BIND" "$BINDING_FILE"
-            fi
-            ls -lh "$PREBUILT_DIR" || true
-          fi
+          # Throttle high-frequency build logs to 1 line every 30s to keep GitHub Actions UI responsive
+          python3 .github/scripts/throttle.py --interval 30 --label "Build Android JNI & V8" -- \
+            cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p obscura-android -vv
 
       - name: Verify native library
         run: |
@@ -387,12 +359,12 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
-      # ---------------- Heavy Persistence: Save Caches Even If Cancelled Or Failed ----------------
+      # ---------------- Persistence: Save Only When Needed ----------------
       - name: Prepare directories and stop sccache
         if: always()
         run: |
           sccache --stop-server || true
-          mkdir -p target ~/.cache/sccache ~/.cache/obscura-v8-prebuilt ~/.cargo/bin ~/.cargo/registry/cache ~/.cargo/registry/index ~/.cargo/git/db
+          mkdir -p ~/.cache/sccache ~/.cache/obscura-v8-prebuilt ~/.cargo/bin ~/.cargo/registry/cache ~/.cargo/registry/index ~/.cargo/git/db
 
       - name: Save cargo-ndk binary cache
         uses: actions/cache/save@v6.1.0
@@ -422,59 +394,60 @@ jobs:
           path: /var/cache/apt/archives
           key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/android-release.yml') }}
 
+      - name: Save Cargo registry and git cache
+        uses: actions/cache/save@v6.1.0
+        if: always() && steps.restore-cargo-registry.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Package prebuilt V8 archive (if newly built)
+        id: package-v8
         if: always()
         run: |
           mkdir -p ~/.cache/obscura-v8-prebuilt
           ARCHIVE_FILE="$HOME/.cache/obscura-v8-prebuilt/librusty_v8_release_aarch64-linux-android.a.gz"
           BINDING_FILE="$HOME/.cache/obscura-v8-prebuilt/src_binding_release_aarch64-linux-android.rs"
-          if [ ! -s "$ARCHIVE_FILE" ]; then
+          if [ ! -s "$ARCHIVE_FILE" ] || [ ! -s "$BINDING_FILE" ]; then
             V8_LIB="$(find target/ -name "librusty_v8.a" 2>/dev/null | head -n 1)"
             V8_BIND="$(find target/ -name "src_binding.rs" 2>/dev/null | head -n 1)"
             if [ -n "$V8_LIB" ] && [ -f "$V8_LIB" ]; then
-              echo "Compressing $V8_LIB -> $ARCHIVE_FILE"
-              gzip -9 -c "$V8_LIB" > "$ARCHIVE_FILE"
+              echo "Compressing $V8_LIB -> $ARCHIVE_FILE (sampling logs every 30s)..."
+              python3 .github/scripts/throttle.py --interval 30 --label "Package prebuilt V8 archive" --watch-file "$ARCHIVE_FILE" --shell-cmd "gzip -9 -c '$V8_LIB' > '$ARCHIVE_FILE'"
             fi
             if [ -n "$V8_BIND" ] && [ -f "$V8_BIND" ]; then
               echo "Copying $V8_BIND -> $BINDING_FILE"
               cp "$V8_BIND" "$BINDING_FILE"
             fi
           fi
+          if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
+            echo "has_v8=true" >> $GITHUB_OUTPUT
+            echo "✅ Prebuilt V8 archive ready."
+          else
+            echo "has_v8=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Prebuilt V8 archive not available."
+          fi
           ls -lh ~/.cache/obscura-v8-prebuilt/ || true
 
       - name: Save prebuilt V8 cache
         uses: actions/cache/save@v6.1.0
-        if: always()
+        if: steps.package-v8.outputs.has_v8 == 'true' && steps.cache-v8-prebuilt.outputs.cache-hit != 'true'
         with:
           path: ~/.cache/obscura-v8-prebuilt
-          key: v8-prebuilt-v150.4.0-aarch64-linux-android-r26d-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: v8-prebuilt-v150.4.0-aarch64-linux-android-r26d-v2
 
-      - name: Save target build cache (Resume support on cancel or failure)
+      - name: Save sccache directory (Resume support on cancel or failure)
         uses: actions/cache/save@v6.1.0
-        if: success()
-        with:
-          path: target
-          key: cargo-target-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Save sccache directory (Compiler objects on failure/cancel)
-        uses: actions/cache/save@v6.1.0
-        if: always()
+        if: (cancelled() || failure()) && steps.package-v8.outputs.has_v8 != 'true'
         with:
           path: ~/.cache/sccache
           key: sccache-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Save Cargo registry and git cache
-        uses: actions/cache/save@v6.1.0
-        if: always()
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
       - name: Upload prebuilt V8 cache artifact
-        if: always()
+        if: steps.package-v8.outputs.has_v8 == 'true'
         uses: actions/upload-artifact@v7.0.2
         with:
           name: obscura-v8-prebuilt-android
