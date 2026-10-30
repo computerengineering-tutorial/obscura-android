@@ -2,7 +2,7 @@
 //! and Model Context Protocol (MCP) servers to Android.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::thread;
 
 use jni::objects::{JClass, JString};
@@ -145,11 +145,11 @@ fn get_optional_jstring(env: &mut JNIEnv, js: &JString) -> Option<String> {
 /// Fetch HTML from URL with default settings (backward-compatible).
 #[no_mangle]
 pub extern "system" fn Java_com_obscura_app_ObscuraBridge_nativeFetchHtml(
-    mut env: JNIEnv,
+    env: JNIEnv,
     class: JClass,
     url: JString,
 ) -> jstring {
-    let null_opts = JString::from(std::ptr::null_mut());
+    let null_opts = unsafe { JString::from_raw(std::ptr::null_mut()) };
     Java_com_obscura_app_ObscuraBridge_nativeFetchHtmlWithOptions(env, class, url, null_opts)
 }
 
@@ -418,19 +418,18 @@ pub extern "system" fn Java_com_obscura_app_ObscuraBridge_nativeExtractMarkdown(
 /// Start CDP server on specified port (backward-compatible).
 #[no_mangle]
 pub extern "system" fn Java_com_obscura_app_ObscuraBridge_nativeStartCdp(
-    mut env: JNIEnv,
+    env: JNIEnv,
     class: JClass,
     port: jint,
 ) -> jboolean {
-    let null_str = JString::from(std::ptr::null_mut());
     Java_com_obscura_app_ObscuraBridge_nativeStartCdpWithOptions(
         env,
         class,
         port,
-        null_str,
-        null_str,
+        unsafe { JString::from_raw(std::ptr::null_mut()) },
+        unsafe { JString::from_raw(std::ptr::null_mut()) },
         0,
-        null_str,
+        unsafe { JString::from_raw(std::ptr::null_mut()) },
     )
 }
 
@@ -603,19 +602,18 @@ pub extern "system" fn Java_com_obscura_app_ObscuraBridge_nativeGetCdpEndpoint(
 /// Start MCP HTTP/SSE server on specified port.
 #[no_mangle]
 pub extern "system" fn Java_com_obscura_app_ObscuraBridge_nativeStartMcp(
-    mut env: JNIEnv,
+    env: JNIEnv,
     class: JClass,
     port: jint,
 ) -> jboolean {
-    let null_str = JString::from(std::ptr::null_mut());
     Java_com_obscura_app_ObscuraBridge_nativeStartMcpWithOptions(
         env,
         class,
         port,
-        null_str,
-        null_str,
+        unsafe { JString::from_raw(std::ptr::null_mut()) },
+        unsafe { JString::from_raw(std::ptr::null_mut()) },
         0,
-        null_str,
+        unsafe { JString::from_raw(std::ptr::null_mut()) },
     )
 }
 
