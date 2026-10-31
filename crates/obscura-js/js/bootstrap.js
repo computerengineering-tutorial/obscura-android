@@ -4156,6 +4156,10 @@ class Element extends Node {
     return this._tagName;
   }
   get nodeName() { return this.tagName; }
+  get prefix() {
+    if (this._prefix === undefined) this._prefix = _domParse("prefix", this._nid);
+    return this._prefix;
+  }
   get localName() {
     // The native tree owns the namespace-aware QualName. Reading its local
     // component directly preserves case-sensitive SVG/MathML names such as
@@ -5207,7 +5211,7 @@ class Element extends Node {
   }
   _loadIframeSrc(url, submission) {
     if (!submission && this.hasAttribute('srcdoc')) { this._loadIframeSrcdoc(); return; }
-    if (url === 'about:blank' || !url) { this._resetIframeFrame(); return; }
+    if (url === 'about:blank' || !url) { this._resetIframeFrame(); if (submission) _ensureInitialFrameRealm(this); return; }
     let fullUrl = url;
     if (!url.includes('://')) {
       try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
@@ -5505,9 +5509,9 @@ class Element extends Node {
       }
     }
     if (method === 'POST') {
-      __obscuraCore.ops.op_navigate(targetUrl, 'POST', encoded);
+      __obscuraCore.ops.op_navigate(targetUrl, 'POST', encoded, _realmFrameId);
     } else {
-      __obscuraCore.ops.op_navigate(targetUrl, 'GET', '');
+      __obscuraCore.ops.op_navigate(targetUrl, 'GET', '', _realmFrameId);
     }
   }
   reset() {
@@ -6624,7 +6628,7 @@ class Document extends Node {
       "http://www.w3.org/1999/xhtml",
       localName,
     );
-    const el = new C(nid);
+    const el = new C(nid, _htmlInterfaceToken);
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
@@ -6647,7 +6651,7 @@ class Document extends Node {
     const namespace = ns == null ? null : String(ns);
     const qualified = String(t);
     _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
-    if (namespace === "http://www.w3.org/1999/xhtml") {
+    if (namespace === "http://www.w3.org/1999/xhtml" && qualified === qualified.toLowerCase() && !qualified.includes(':')) {
       const el = this.createElement(qualified);
       if (el) el._ns = namespace;
       return el;
@@ -6657,12 +6661,12 @@ class Document extends Node {
       (namespace == null ? "" : namespace) + "\0" + qualified,
     );
     const effectiveNamespace = namespace == null ? "" : namespace;
-    const C = _elementClassForKnownName(effectiveNamespace, qualified);
-    const el = new C(nid);
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
-    el._tagName = qualified;
+    const C = _elementClassForKnownName(effectiveNamespace, localName);
+    const el = new C(nid, _htmlInterfaceToken);
+    el._tagName = effectiveNamespace === "http://www.w3.org/1999/xhtml" ? qualified.toUpperCase() : qualified;
     el._lname = localName;
     el._ns = effectiveNamespace;
     el._nullNamespaceAttrs = new Map();
@@ -7744,8 +7748,13 @@ globalThis.TextTrackCue = TextTrackCue;
 globalThis.TextTrackCueList = TextTrackCueList;
 globalThis.VTTCue = VTTCue;
 
+const _htmlInterfaceToken = {};
+const _additionalHtmlElementClasses = Object.create(null);
 const _elementClassFor = (function _elementClassFor(nid) {
   const tag = _domParse("tag_name", nid);
+  if (tag.includes(":") && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml") {
+    return _elementClassForKnownName("http://www.w3.org/1999/xhtml", _domParse("local_name", nid));
+  }
   // HTML tagName values are ASCII-uppercase. Foreign SVG names retain their
   // case, so keep the common HTML path fast and only inspect the native
   // namespace for possible SVG wrappers.
@@ -7784,12 +7793,12 @@ const _elementClassFor = (function _elementClassFor(nid) {
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
+  const additional = _additionalHtmlElementClasses[tag];
+  if (additional && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === tag.toLowerCase()) return additional;
   return Element;
 });
-const _elementClassForKnownName = (function _elementClassForKnownName(namespace, qualifiedName) {
-  const localName = qualifiedName.includes(":")
-    ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
-    : qualifiedName;
+const _elementClassForKnownName = (function _elementClassForKnownName(namespace, localName) {
   if (namespace === "http://www.w3.org/2000/svg") {
     const svgClass = _svgElementClasses[localName];
     if (svgClass) return svgClass;
@@ -7810,15 +7819,18 @@ const _elementClassForKnownName = (function _elementClassForKnownName(namespace,
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
+    const additional = _additionalHtmlElementClasses[localName];
+    if (additional && localName === localName.toLowerCase()) return additional;
   }
   return Element;
 });
 const _wrap = (function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
+  const cached = _cache.get(nid);
+  if (cached !== undefined) return cached;
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid, _htmlInterfaceToken); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
@@ -7829,11 +7841,13 @@ const _wrap = (function _wrap(nid) {
   _cache.set(nid, n);
   return n;
 });
+// Keep the common cached-node path small enough for V8 to inline.
 const _wrapEl = (function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
-  if (_cache.has(nid)) return _cache.get(nid);
+  const cached = _cache.get(nid);
+  if (cached !== undefined) return cached;
   const C = _elementClassFor(nid);
-  const n = new C(nid);
+  const n = new C(nid, _htmlInterfaceToken);
   _cache.set(nid, n);
   return n;
 });
@@ -7886,7 +7900,7 @@ function __locationNavigate(url, replace) {
     return;
   }
   globalThis.__virtualUrl = r;
-  __obscuraCore.ops.op_navigate(r, 'GET', '');
+  __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId);
 }
 // Location setters (HTML spec): change one component of a copy of the current
 // URL, then navigate to it. Only the fragment setter can stay in-document.
@@ -7923,7 +7937,7 @@ globalThis.location = {
   set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
   assign(url) { __locationNavigate(url, false); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
   replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
@@ -13394,7 +13408,7 @@ globalThis.atob = globalThis.atob || ((s) => {
   let forwardCleared = false;
   const session = () => {
     try {
-      const [start, current, length] = String(__obscuraCore.ops.op_session_history())
+      const [start, current, length] = String(__obscuraCore.ops.op_session_history(_realmFrameId))
         .split(",").map(Number);
       if (length > 0) {
         return {start, current, before: start,
@@ -13520,9 +13534,9 @@ globalThis.atob = globalThis.atob || ((s) => {
         // Another document's entry: the page loads it and moves its cursor.
         const {start, current, before, after} = session();
         if (target < 0 && -target <= before) {
-          __obscuraCore.ops.op_history_traverse(start + target);
+          __obscuraCore.ops.op_history_traverse(start + target, _realmFrameId);
         } else if (target >= stack.length && target - (stack.length - 1) <= after) {
-          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1));
+          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1), _realmFrameId);
         }
         return;
       }
@@ -14362,6 +14376,39 @@ globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
 globalThis.HTMLDetailsElement = Element;
 globalThis.HTMLDialogElement = Element;
+// Identity-only interfaces still need distinct prototypes. Inheriting Element
+// preserves implemented DOM behavior without making unrelated tags pass brand checks.
+for (const [name, tags] of Object.entries({
+  HTMLAreaElement: ['area'], HTMLBaseElement: ['base'], HTMLDListElement: ['dl'],
+  HTMLDataElement: ['data'], HTMLDirectoryElement: ['dir'], HTMLEmbedElement: ['embed'],
+  HTMLFontElement: ['font'], HTMLFrameElement: ['frame'], HTMLFrameSetElement: ['frameset'],
+  HTMLMapElement: ['map'], HTMLMarqueeElement: ['marquee'], HTMLMenuElement: ['menu'],
+  HTMLMeterElement: ['meter'], HTMLModElement: ['del', 'ins'], HTMLObjectElement: ['object'],
+  HTMLOptGroupElement: ['optgroup'], HTMLOutputElement: ['output'], HTMLParamElement: ['param'],
+  HTMLPictureElement: ['picture'], HTMLQuoteElement: ['blockquote', 'q'], HTMLSourceElement: ['source'],
+  HTMLTableCaptionElement: ['caption'], HTMLTableCellElement: ['td', 'th'],
+  HTMLTableColElement: ['col', 'colgroup'], HTMLTableRowElement: ['tr'],
+  HTMLTableSectionElement: ['tbody', 'thead', 'tfoot'], HTMLTimeElement: ['time'], HTMLTitleElement: ['title'],
+})) {
+  if (globalThis[name] !== undefined) continue;
+  const Interface = class extends Element {
+    constructor(nid, token) {
+      if (token !== _htmlInterfaceToken) {
+        const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
+        if (!entry || new.target !== entry.constructor || entry.constructed) throw new TypeError('Illegal constructor');
+      }
+      super(nid);
+    }
+  };
+  Object.defineProperty(Interface, 'name', {value: name, configurable: true});
+  Object.defineProperty(Interface.prototype, Symbol.toStringTag, {value: name, configurable: true});
+  Object.defineProperty(globalThis, name, {value: Interface, writable: true, configurable: true});
+  for (const tag of tags) {
+    _additionalHtmlElementClasses[tag] = Interface;
+    _additionalHtmlElementClasses[tag.toUpperCase()] = Interface;
+  }
+}
+
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
 // baseVal is writable. Used by the SVG-aware get className()/get href() above.

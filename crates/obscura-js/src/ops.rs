@@ -1243,6 +1243,16 @@ impl RealmStates {
         removed
     }
 
+    pub(crate) fn has_pending_navigation(&self) -> bool {
+        self.entries.iter().any(|(_, _, state)| state.borrow().pending_navigation.is_some())
+    }
+
+    pub(crate) fn take_pending_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.entries.iter().filter_map(|(_, id, state)| {
+            state.borrow_mut().pending_navigation.take().map(|(url, method, body)| (*id, url, method, body))
+        }).collect()
+    }
+
     pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
@@ -2651,7 +2661,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
                         if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
+                            match &name.prefix {
+                                Some(prefix) => {
+                                    let mut qualified = format!("{}:{}", prefix, name.local);
+                                    qualified.make_ascii_uppercase();
+                                    qualified
+                                }
+                                None => name.local.as_ref().to_ascii_uppercase(),
+                            }
                         } else {
                             match &name.prefix {
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
@@ -2663,6 +2680,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .flatten()
                 .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
+        }
+        "prefix" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let prefix = dom.with_node(NodeId::new(nid), |n| {
+                n.as_element().and_then(|name| name.prefix.as_ref().map(|prefix| prefix.to_string()))
+            }).flatten();
+            serde_json::to_string(&prefix).unwrap_or("null".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -6451,12 +6475,17 @@ pub struct SessionHistory {
     pub current: usize,
 }
 
+fn navigation_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
+    state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow().by_frame_id(frame_id)
+}
+
 /// `"documentStart,current,length"` of the session history; length is 0 when
 /// this realm has none.
 #[op2]
 #[string]
-fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
-    let gs = realm_state(scope, state);
+fn op_session_history(state: &OpState, frame_id: u32) -> String {
+    let Some(gs) = navigation_state(state, frame_id) else { return "0,0,0".into(); };
     let gs = gs.borrow();
     let history = &gs.session_history;
     format!("{},{},{}", history.document_start, history.current, history.urls.len())
@@ -6465,8 +6494,8 @@ fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// Queue a traversal to another document's session history entry. Returns
 /// false when the index is out of range.
 #[op2(fast)]
-fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) -> bool {
-    let gs = realm_state(scope, state);
+fn op_history_traverse(state: &OpState, index: u32, frame_id: u32) -> bool {
+    let Some(gs) = navigation_state(state, frame_id) else { return false; };
     let mut gs = gs.borrow_mut();
     let index = index as usize;
     let Some(url) = gs.session_history.urls.get(index).cloned() else {
@@ -6478,16 +6507,19 @@ fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) ->
 }
 
 // A frame that navigates itself must not move the top document. Recording the
-// navigation against the calling realm keeps it inside that frame.
+// navigation against the realm that owns the Location object keeps it inside
+// that frame, also when another realm calls it: the page can run
+// `iframe.contentWindow.location.replace(url)`, and the running context is
+// then the page's, not the frame's (see `frame_state`).
 #[op2(fast)]
 fn op_navigate(
-    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] method: &str,
     #[string] body: &str,
+    frame_id: u32,
 ) {
-    let gs = realm_state(scope, state);
+    let Some(gs) = navigation_state(state, frame_id) else { return; };
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
     // updated on commit via `set_url` once the navigation is actually performed.
