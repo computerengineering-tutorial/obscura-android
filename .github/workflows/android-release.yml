@@ -5,6 +5,11 @@ name: Android Release
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      rebuild_v8:
+        description: "Rebuild V8 Engine & Bindings from source with Clang (Option 1). Unchecked = Use prebuilt/fast bindings (Option 2)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -19,6 +24,7 @@ jobs:
     timeout-minutes: 360
 
     env:
+      REBUILD_V8: ${{ github.event.inputs.rebuild_v8 || 'false' }}
       CARGO_INCREMENTAL: 0
       CARGO_BUILD_JOBS: 2
       NUM_JOBS: 2
@@ -181,20 +187,25 @@ jobs:
       - name: Check and prepare prebuilt V8 binaries
         run: |
           mkdir -p ~/.cache/obscura-v8-prebuilt
-          ARCHIVE_FILE="$HOME/.cache/obscura-v8-prebuilt/librusty_v8_release_aarch64-linux-android.a.gz"
-          BINDING_FILE="$HOME/.cache/obscura-v8-prebuilt/src_binding_release_aarch64-linux-android.rs"
-          if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
-            echo "✅ Prebuilt V8 binaries restored from GitHub Actions cache!"
+          if [ "$REBUILD_V8" = "true" ]; then
+            echo "🔄 REBUILD_V8=true (Option 1 selected): bypassing prebuilt V8 cache to force rebuild from source."
+            rm -rf ~/.cache/obscura-v8-prebuilt/*
           else
-            echo "Checking if prebuilt V8 is published in GitHub Releases..."
-            V8_RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v8-android-v150.4.0"
-            if curl -fsSL -I "$V8_RELEASE_URL/librusty_v8_release_aarch64-linux-android.a.gz" >/dev/null 2>&1; then
-              echo "Downloading prebuilt V8 archive from $V8_RELEASE_URL..."
-              curl -fsSL "$V8_RELEASE_URL/librusty_v8_release_aarch64-linux-android.a.gz" -o "$ARCHIVE_FILE"
-              curl -fsSL "$V8_RELEASE_URL/src_binding_release_aarch64-linux-android.rs" -o "$BINDING_FILE"
-              echo "✅ Successfully downloaded prebuilt V8 from GitHub Release!"
+            ARCHIVE_FILE="$HOME/.cache/obscura-v8-prebuilt/librusty_v8_release_aarch64-linux-android.a.gz"
+            BINDING_FILE="$HOME/.cache/obscura-v8-prebuilt/src_binding_release_aarch64-linux-android.rs"
+            if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
+              echo "✅ Prebuilt V8 binaries restored from GitHub Actions cache!"
             else
-              echo "ℹ️ Prebuilt V8 not found in cache or release; will build from source."
+              echo "Checking if prebuilt V8 is published in GitHub Releases..."
+              V8_RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/v8-android-v150.4.0"
+              if curl -fsSL -I "$V8_RELEASE_URL/librusty_v8_release_aarch64-linux-android.a.gz" >/dev/null 2>&1; then
+                echo "Downloading prebuilt V8 archive from $V8_RELEASE_URL..."
+                curl -fsSL "$V8_RELEASE_URL/librusty_v8_release_aarch64-linux-android.a.gz" -o "$ARCHIVE_FILE"
+                curl -fsSL "$V8_RELEASE_URL/src_binding_release_aarch64-linux-android.rs" -o "$BINDING_FILE"
+                echo "✅ Successfully downloaded prebuilt V8 from GitHub Release!"
+              else
+                echo "ℹ️ Prebuilt V8 not found in cache or release; will build from source."
+              fi
             fi
           fi
           ls -lh ~/.cache/obscura-v8-prebuilt/ || true
@@ -255,11 +266,7 @@ jobs:
 
           # Patch v8 and deno_core crates for Android cross-compilation
           for v8_dir in $(find ~/.cargo/registry/src/ -type d -name "v8-*" 2>/dev/null); do
-            p="$v8_dir/build.rs"
-            if [ -f "$p" ]; then
-              sed -z -i 's@fn static_lib_url() -> String {\n  if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {\n    return custom_archive;\n  }@fn static_lib_url() -> String {\n  let target = env::var("TARGET").unwrap_or_default();\n  let host = env::var("HOST").unwrap_or_default();\n  if target != host || target.contains("android") {\n    if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {\n      return custom_archive;\n    }\n  }@' "$p"
-              sed -z -i 's@fn print_prebuilt_src_binding_path() {\n  if let Ok(binding) = env::var("RUSTY_V8_SRC_BINDING_PATH") {\n    println!("cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={binding}");\n    return;\n  }@fn print_prebuilt_src_binding_path() {\n  let target = env::var("TARGET").unwrap_or_default();\n  let host = env::var("HOST").unwrap_or_default();\n  if target != host || target.contains("android") {\n    if let Ok(binding) = env::var("RUSTY_V8_SRC_BINDING_PATH") {\n      println!("cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={binding}");\n      return;\n    }\n  }@' "$p"
-            fi
+            python3 .github/scripts/patch_v8.py "$v8_dir"
           done
           for deno_dir in $(find ~/.cargo/registry/src/ -type d -name "deno_core-*" 2>/dev/null); do
             p="$deno_dir/uv_compat/tty.rs"
@@ -365,7 +372,15 @@ jobs:
           ARCHIVE_FILE="$PREBUILT_DIR/librusty_v8_release_aarch64-linux-android.a.gz"
           BINDING_FILE="$PREBUILT_DIR/src_binding_release_aarch64-linux-android.rs"
 
-          if [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
+          if [ "$REBUILD_V8" = "true" ]; then
+            echo "🔧 ========================================================"
+            echo "🔧 [Option 1] Rebuilding V8 & Bindings from source with Clang"
+            echo "🔧 ========================================================"
+            export V8_FROM_SOURCE=1
+            export OBSCURA_REBUILD_V8=1
+            unset RUSTY_V8_ARCHIVE
+            unset RUSTY_V8_SRC_BINDING_PATH
+          elif [ -s "$ARCHIVE_FILE" ] && [ -s "$BINDING_FILE" ]; then
             echo "⚡ ========================================================"
             echo "⚡ Using prebuilt V8 Android binaries! (Ultra-Fast Mode)"
             echo "⚡ Archive: $ARCHIVE_FILE"
@@ -374,15 +389,15 @@ jobs:
             export RUSTY_V8_ARCHIVE="$ARCHIVE_FILE"
             export RUSTY_V8_SRC_BINDING_PATH="$BINDING_FILE"
             unset V8_FROM_SOURCE
+            export OBSCURA_REBUILD_V8=0
           else
-            echo "⚠️ ========================================================"
-            echo "⚠️ Compiling V8 from source (or resuming from checkpoint)."
-            echo "⚠️ ========================================================"
+            echo "⚡ ========================================================"
+            echo "⚡ [Option 2] Building V8 engine with fast pre-generated aarch64 bindings"
+            echo "⚡ ========================================================"
             export V8_FROM_SOURCE=1
-            RESUMED_O_COUNT=$(find target/ -name "*.o" 2>/dev/null | wc -l)
-            if [ "$RESUMED_O_COUNT" -gt 0 ]; then
-              echo "⚡ Resuming V8 build: detected $RESUMED_O_COUNT pre-compiled object files!"
-            fi
+            export OBSCURA_REBUILD_V8=0
+            unset RUSTY_V8_ARCHIVE
+            unset RUSTY_V8_SRC_BINDING_PATH
           fi
 
           # Native Ninja status format streamed via Cargo very-verbose mode (-vv)

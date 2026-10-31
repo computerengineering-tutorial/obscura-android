@@ -142,6 +142,9 @@ def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_l
                 error_lines = []
                 with open(log_file, "r", encoding="utf-8", errors="replace") as f:
                     for l in f:
+                        cleaned = l.strip()
+                        if cleaned.startswith("Running ") or cleaned.startswith("Caused by:"):
+                            continue
                         if any(marker in l for marker in ["error:", "FAILED:", "fatal error:", "undefined reference", "cargo:warning"]):
                             error_lines.append(l.rstrip())
                 if error_lines:
