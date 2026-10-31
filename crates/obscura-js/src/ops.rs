@@ -2651,7 +2651,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
                         if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
+                            match &name.prefix {
+                                Some(prefix) => {
+                                    let mut qualified = format!("{}:{}", prefix, name.local);
+                                    qualified.make_ascii_uppercase();
+                                    qualified
+                                }
+                                None => name.local.as_ref().to_ascii_uppercase(),
+                            }
                         } else {
                             match &name.prefix {
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
@@ -2663,6 +2670,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .flatten()
                 .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
+        }
+        "prefix" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let prefix = dom.with_node(NodeId::new(nid), |n| {
+                n.as_element().and_then(|name| name.prefix.as_ref().map(|prefix| prefix.to_string()))
+            }).flatten();
+            serde_json::to_string(&prefix).unwrap_or("null".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
