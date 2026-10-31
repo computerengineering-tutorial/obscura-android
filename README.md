@@ -379,7 +379,7 @@ MCP functionality.
 - `event.isTrusted = true` for dispatched events
 - Hidden internal properties (`Object.keys(window)` safe)
 - Native function masking (`Function.prototype.toString()` → `[native code]`)
-- `navigator.webdriver = undefined` (matches real Chrome)
+- `navigator.webdriver = false`
 
 ### Tracker Blocking
 - 3,520 domains blocked
