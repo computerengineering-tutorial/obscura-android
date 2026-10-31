@@ -65,7 +65,7 @@ const __obscuraCore = globalThis.Deno.core;
     // Pre-declaring them non-enumerable here is enough -- per the note above,
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
-    'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
+    'DOMImplementation', 'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
     'CSSStyleDeclaration', 'CSSRule', 'CSSStyleRule', 'CSSGroupingRule',
@@ -6354,6 +6354,75 @@ function _throwDocumentDomainSecurityError() {
   throw new DOMException("Failed to set the 'domain' property on 'Document'", "SecurityError");
 }
 
+// document.implementation is one DOMImplementation object per document, and the
+// interface is a global, as in browsers. Consent managers reference the global
+// (`x instanceof DOMImplementation`) while booting, so a plain object threw a
+// ReferenceError there.
+const _domImplementationToken = Symbol("DOMImplementation");
+class DOMImplementation {
+  #doc;
+  constructor() {
+    if (arguments[0] !== _domImplementationToken) {
+      throw new TypeError("Failed to construct 'DOMImplementation': Illegal constructor");
+    }
+    this.#doc = arguments[1];
+  }
+  // Spec: createHTMLDocument returns a NEW detached Document. jQuery
+  // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
+  // the result: when we returned `globalThis.document`, the real
+  // `<body>` was wiped, taking every page on the open web that ships
+  // jQuery 3.x with it. Reuse the DOMParser path to build a detached
+  // document, then optionally set the title.
+  createHTMLDocument(title) {
+    const doc = _createDetachedDocument("text/html", false);
+    doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
+    const html = doc.createElement("html");
+    doc.appendChild(html);
+    const head = doc.createElement("head");
+    html.appendChild(head);
+    if (title !== undefined) {
+      const titleEl = doc.createElement("title");
+      titleEl.appendChild(doc.createTextNode(String(title)));
+      head.appendChild(titleEl);
+    }
+    html.appendChild(doc.createElement("body"));
+    return doc;
+  }
+  createDocument(namespace, qualifiedName, doctype) {
+    const ns = namespace == null ? null : String(namespace);
+    const contentType = ns === "http://www.w3.org/1999/xhtml"
+      ? "application/xhtml+xml"
+      : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
+    const doc = _createDetachedDocument(contentType, true);
+    const name = qualifiedName == null ? "" : String(qualifiedName);
+    const element = name === "" ? null : doc.createElementNS(ns, name);
+    if (doctype != null) doc.appendChild(doctype);
+    if (element) doc.appendChild(element);
+    return doc;
+  }
+  // createDocumentType(qualifiedName, publicId, systemId): build a detached
+  // DocumentType node. Browsers validate leniently here (only a name with
+  // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
+  // owner document is the document whose implementation was used.
+  createDocumentType(qualifiedName, publicId, systemId) {
+    const name = String(qualifiedName);
+    if (name === "" || /[\t\n\f\r >]/.test(name)) {
+      throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
+    }
+    const dt = new DocumentType(
+      +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
+      name,
+      publicId === undefined ? "" : String(publicId),
+      systemId === undefined ? "" : String(systemId)
+    );
+    _seedDetachedTreeState(dt);
+    _cache.set(dt._nid, dt);
+    return _stampNodeDocument(dt, this.#doc);
+  }
+  hasFeature() { return true; }
+  get [Symbol.toStringTag]() { return "DOMImplementation"; }
+}
+
 const _documentInstances = new WeakSet();
 class Document extends Node {
   constructor(nid) {
@@ -6913,62 +6982,10 @@ class Document extends Node {
   // body, but we never parse in quirks mode.
   get scrollingElement() { return this.documentElement; }
   get implementation() {
-    const ownerDoc = this;
-    return {
-      // Spec: createHTMLDocument returns a NEW detached Document. jQuery
-      // 3.x's selector feature-detect calls `body.innerHTML = '<form>'` on
-      // the result: when we returned `globalThis.document`, the real
-      // `<body>` was wiped, taking every page on the open web that ships
-      // jQuery 3.x with it. Reuse the DOMParser path to build a detached
-      // document, then optionally set the title.
-      createHTMLDocument(title) {
-        const doc = _createDetachedDocument("text/html", false);
-        doc.appendChild(doc.implementation.createDocumentType("html", "", ""));
-        const html = doc.createElement("html");
-        doc.appendChild(html);
-        const head = doc.createElement("head");
-        html.appendChild(head);
-        if (title !== undefined) {
-          const titleEl = doc.createElement("title");
-          titleEl.appendChild(doc.createTextNode(String(title)));
-          head.appendChild(titleEl);
-        }
-        html.appendChild(doc.createElement("body"));
-        return doc;
-      },
-      createDocument(namespace, qualifiedName, doctype) {
-        const ns = namespace == null ? null : String(namespace);
-        const contentType = ns === "http://www.w3.org/1999/xhtml"
-          ? "application/xhtml+xml"
-          : (ns === "http://www.w3.org/2000/svg" ? "image/svg+xml" : "application/xml");
-        const doc = _createDetachedDocument(contentType, true);
-        const name = qualifiedName == null ? "" : String(qualifiedName);
-        const element = name === "" ? null : doc.createElementNS(ns, name);
-        if (doctype != null) doc.appendChild(doctype);
-        if (element) doc.appendChild(element);
-        return doc;
-      },
-      // createDocumentType(qualifiedName, publicId, systemId): build a detached
-      // DocumentType node. Browsers validate leniently here (only a name with
-      // ASCII whitespace or ">" is rejected, matching the WPT cases); the node's
-      // owner document is the document whose implementation was used.
-      createDocumentType(qualifiedName, publicId, systemId) {
-        const name = String(qualifiedName);
-        if (name === "" || /[\t\n\f\r >]/.test(name)) {
-          throw new DOMException("The qualified name '" + name + "' contains an invalid character", "InvalidCharacterError");
-        }
-        const dt = new DocumentType(
-          +_dom("create_doctype", name, publicId === undefined ? "" : String(publicId)),
-          name,
-          publicId === undefined ? "" : String(publicId),
-          systemId === undefined ? "" : String(systemId)
-        );
-        _seedDetachedTreeState(dt);
-        _cache.set(dt._nid, dt);
-        return _stampNodeDocument(dt, ownerDoc);
-      },
-      hasFeature() { return true; },
-    };
+    if (!this._implementation) {
+      this._implementation = new DOMImplementation(_domImplementationToken, this);
+    }
+    return this._implementation;
   }
   get styleSheets() {
     if (!this._styleSheetList) this._styleSheetList = new StyleSheetList(this);
@@ -10821,11 +10838,14 @@ function _replaceAdoptedStyleSheets(root, sheets) {
   return list;
 }
 
+// configurable like every WebIDL attribute: constructable-stylesheet polyfills
+// redefine it on Document.prototype and threw "Cannot redefine property".
 Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
   get() { return _adoptedStyleSheetsFor(this); },
   set(sheets) {
     _replaceAdoptedStyleSheets(this, sheets);
   },
+  configurable: true,
 });
 
 globalThis.__mutationObservers = [];
@@ -14543,6 +14563,7 @@ function _isValidPITarget(target) {
 }
 globalThis.DocumentFragment = DocumentFragment;
 globalThis.DocumentType = DocumentType;
+globalThis.DOMImplementation = DOMImplementation;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;

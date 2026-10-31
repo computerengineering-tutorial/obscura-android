@@ -23937,6 +23937,41 @@ mod tests {
     }
 
     #[test]
+    fn document_implementation_is_a_dom_implementation_interface() {
+        let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const impl = document.implementation;
+            let illegal = false;
+            try { new DOMImplementation(); } catch (e) { illegal = e instanceof TypeError; }
+            const doc = impl.createHTMLDocument("t");
+            return [typeof DOMImplementation, impl instanceof DOMImplementation,
+                impl === document.implementation, illegal,
+                Object.prototype.toString.call(impl),
+                Object.getOwnPropertyDescriptor(globalThis, "DOMImplementation").enumerable,
+                doc.implementation instanceof DOMImplementation,
+                doc.implementation !== impl,
+                impl.createDocumentType("html", "", "").ownerDocument === document];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "function", true, true, true, "[object DOMImplementation]",
+            false, true, true, true
+        ]));
+    }
+
+    #[test]
+    fn document_adopted_stylesheets_is_configurable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const desc = Object.getOwnPropertyDescriptor(Document.prototype, "adoptedStyleSheets");
+            Object.defineProperty(Document.prototype, "adoptedStyleSheets", {
+                get: desc.get, set: desc.set, configurable: true,
+            });
+            return [desc.configurable, Array.isArray(document.adoptedStyleSheets)];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    #[test]
     fn test_xml_serializer_doctype() {
         let mut rt = setup_runtime("<!DOCTYPE html><html><body></body></html>");
         let result = rt
