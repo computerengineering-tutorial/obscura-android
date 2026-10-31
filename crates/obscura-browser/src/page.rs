@@ -1797,6 +1797,74 @@ impl Page {
             .unwrap_or([255, 255, 255, 255])
     }
 
+    async fn intercept_navigation(&self, url: &Url, method: &str, body: &str) -> Result<Option<Response>, PageError> {
+        use obscura_js::ops::{InterceptedRequest, InterceptResolution};
+        if !self.intercept_enabled || !matches!(url.scheme(), "http" | "https")
+            || (!self.intercept_block_patterns.is_empty() && !self.intercept_block_patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url.as_str()))) {
+            return Ok(None);
+        }
+        let Some(tx) = &self.intercept_tx else { return Ok(None); };
+        let request_headers = self.http_client.extra_headers.read().await.clone();
+        let (resolver, resolution) = tokio::sync::oneshot::channel();
+        let request = InterceptedRequest {request_id: format!("{}.{}", self.id, self.network_event_counter + 1),
+            page_id: self.id.clone(), url: url.to_string(), method: method.into(), headers: request_headers.clone(),
+            resource_type: "Document".into(), resolver};
+        if tx.send(request).is_err() { return Ok(None); }
+        let response = match resolution.await {
+            Ok(InterceptResolution::Fulfill {status, headers: supplied, body, body_base64}) => {
+                let bytes = if body_base64.is_empty() { body.into_bytes() } else {
+                    BASE64.decode(body_base64).map_err(|error| PageError::NetworkError(error.to_string()))?
+                };
+                if bytes.len() > ResourceRequest::navigation().max_response_bytes {
+                    return Err(PageError::NetworkError("Fulfilled document exceeds the response body limit".into()));
+                }
+                let mut headers = std::collections::HashMap::new();
+                for (name, value) in supplied {
+                    let name = name.to_ascii_lowercase();
+                    if name == "set-cookie" {
+                        headers.entry(name).and_modify(|cookies: &mut String| {
+                            cookies.push('\n'); cookies.push_str(&value);
+                        }).or_insert(value);
+                    } else { headers.insert(name, value); }
+                }
+                if let Some(cookies) = headers.get("set-cookie") {
+                    for cookie in cookies.lines() { self.context.cookie_jar.set_cookie(cookie, url); }
+                }
+                let response = Response {url: url.clone(), status, headers, body: bytes, redirected_from: Vec::new()};
+                let request = obscura_net::RequestInfo {url: url.clone(), method: method.into(), headers: request_headers,
+                    resource_type: ResourceType::Document};
+                self.callbacks.fire_request(&request).await;
+                self.callbacks.fire_response(&request, &response).await;
+                response
+            }
+            Ok(InterceptResolution::Continue {url: rewrite, method: changed_method, headers, body: changed_body}) => {
+                let target = match rewrite { Some(value) => Url::parse(&value).map_err(|error| PageError::InvalidUrl(error.to_string()))?, None => url.clone() };
+                if target.scheme() != url.scheme() {
+                    return Err(PageError::NetworkError("Interception cannot change a navigation's URL scheme".into()));
+                }
+                let method = changed_method.as_deref().unwrap_or(method);
+                let body = changed_body.or_else(|| (!body.is_empty()).then(|| body.as_bytes().to_vec()));
+                #[cfg(feature = "stealth")]
+                if let Some(client) = &self.stealth_client {
+                    return client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
+                        .map(Some).map_err(|error| PageError::NetworkError(error.to_string()));
+                }
+                self.http_client.fetch_navigation_request(&target, method, body, headers, Some(&self.callbacks)).await
+                    .map_err(|error| PageError::NetworkError(error.to_string()))?
+            }
+            Ok(InterceptResolution::Fail {reason}) => {
+                let mut error = String::from("net::ERR_");
+                for (index, ch) in reason.chars().enumerate() {
+                    if index > 0 && ch.is_ascii_uppercase() { error.push('_'); }
+                    error.push(ch.to_ascii_uppercase());
+                }
+                return Err(PageError::NetworkError(error));
+            }
+            Err(_) => return Err(PageError::NetworkError("net::ERR_ABORTED".into())),
+        };
+        Ok(Some(response))
+    }
+
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
@@ -3369,6 +3437,7 @@ impl Page {
                 "file:// navigation is disabled for this browser context: {url_str}"
             )));
         }
+        self.network_events.clear();
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
@@ -3446,7 +3515,9 @@ impl Page {
         self.lifecycle = LifecycleState::Loading;
         self.referrer = referrer.to_string();
         self.url = Some(url.clone());
-        self.network_events.clear();
+        let page_id = self.id.as_str();
+        self.network_events.retain(|event| event.intercepted && event.resource_type == "Document"
+            && event.request_id.strip_prefix(page_id).is_some_and(|suffix| suffix.starts_with('.')));
 
         if self.context.obey_robots {
             if url.scheme() == "http" || url.scheme() == "https" {
@@ -3506,7 +3577,11 @@ impl Page {
         }
 
         self.navigation_timing.record("fetchStart");
-        let response = if url.scheme() == "data" {
+        let intercepted = self.intercept_navigation(&url, method, body).await.map_err(|error| {
+            self.lifecycle = LifecycleState::Failed; error
+        })?;
+        let was_intercepted = intercepted.is_some();
+        let response = if let Some(response) = intercepted { Ok(response) } else if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
                 .and_then(|s| s.split(',').next())
@@ -3543,8 +3618,8 @@ impl Page {
         // corrupts them (issue #340). Text-like types stay as text.
         let main_is_binary = !is_text_like_content_type(response.content_type());
         self.record_network_event_with_body(
-            response.url.as_str(),
-            "GET",
+            if was_intercepted && response.redirected_from.is_empty() { url.as_str() } else { response.url.as_str() },
+            method,
             "Document",
             response.status,
             &response.headers,
@@ -3552,6 +3627,9 @@ impl Page {
             main_is_binary,
         );
 
+        if was_intercepted {
+            if let Some(event) = self.network_events.last_mut() { event.intercepted = true; }
+        }
         if !response.redirected_from.is_empty() {
             self.url = Some(response.url.clone());
         }
@@ -4945,7 +5023,7 @@ impl Page {
         self.preload_scripts.push(script.to_string());
     }
 
-    /// Enable CDP-Fetch-style interception of JS-initiated `fetch()`/XHR.
+    /// Enable CDP-Fetch-style interception of HTTP document navigation and JS `fetch()`/XHR.
     /// Returns a receiver yielding every such request; resolve each through its
     /// `resolver` with `InterceptResolution::{Continue, Fulfill, Fail}` to pass,
     /// mock, or block it. Works in stealth and non-stealth. Mirrors how the CDP
@@ -5117,11 +5195,108 @@ mod tests {
         register_linked_stylesheet_script, script_response_is_executable, split_css_imports,
         stylesheet_graph_is_origin_clean, truncate_on_char_boundary, url_matches_cdp_pattern,
         LoadedStylesheet, PendingFrameWork, StylesheetImport, DEFAULT_NAVIGATION_CHAIN_LIMIT,
+        Page, BrowserContext, LifecycleState, BASE64,
     };
     #[cfg(feature = "render")]
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
+    use std::sync::Arc;
     use obscura_dom::parse_html;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_fulfills_before_transport_and_preserves_bytes() {
+        use obscura_js::ops::InterceptResolution;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let context = Arc::new(BrowserContext::new("document-interception".into()));
+        let mut page = Page::new("document-interception".into(), context);
+        let mut requests = page.enable_interception();
+        let bytes = b"<!doctype html><title>Fulfilled</title><p>replacement</p>".to_vec();
+        let expected = bytes.clone();
+        let (result, ()) = tokio::join!(page.navigate("http://127.0.0.1:9/original"), async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv()).await.unwrap().unwrap();
+            assert_eq!(request.resource_type, "Document");
+            assert_eq!(request.method, "GET");
+            request.resolver.send(InterceptResolution::Fulfill {status: 201,
+                headers: [("content-type".into(), "text/html".into()),
+                    ("Set-Cookie".into(), "first=1; Path=/".into()),
+                    ("set-cookie".into(), "second=2; Path=/".into())].into(),
+                body: "not the decoded body".into(), body_base64: BASE64.encode(bytes)}).ok().unwrap();
+        });
+        result.unwrap();
+        assert_eq!(page.title, "Fulfilled");
+        let document = page.network_events.iter().find(|event| event.resource_type == "Document").unwrap();
+        assert_eq!(document.status, 201);assert!(document.intercepted);
+        assert_eq!(page.response_bodies.get(&document.request_id).unwrap().body, expected);
+        let mut set_cookies = document.response_headers.get("set-cookie").unwrap().lines().collect::<Vec<_>>();
+        set_cookies.sort_unstable();
+        assert_eq!(set_cookies, ["first=1; Path=/", "second=2; Path=/"]);
+        let cookies = page.context.cookie_jar.get_cookie_header(&url::Url::parse("http://127.0.0.1:9/original").unwrap());
+        assert!(cookies.split("; ").any(|cookie| cookie == "first=1"), "{cookies}");
+        assert!(cookies.split("; ").any(|cookie| cookie == "second=2"), "{cookies}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_continues_with_request_local_overrides() {
+        assert_navigation_interception_continues_with_request_local_overrides(false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_continues_with_request_local_overrides_in_stealth() {
+        assert_navigation_interception_continues_with_request_local_overrides(true).await;
+    }
+
+    async fn assert_navigation_interception_continues_with_request_local_overrides(stealth: bool) {
+        use obscura_js::ops::InterceptResolution;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/changed", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();let mut chunk = [0; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();assert!(n>0);
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes==b"\r\n\r\n") {
+                    if request.len()>=end+4+3 {break;}
+                }
+            }
+            let head=String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(head.starts_with("post /changed http/1.1"));
+            assert!(head.contains("content-type: application/octet-stream"));
+            assert!(head.contains("x-navigation: isolated"));
+            assert!(request.ends_with(&[0,255,128]));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 24\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<title>continued</title>").await.unwrap();
+        });
+        let context=Arc::new(BrowserContext::with_storage_and_network("continued-navigation".into(),None,stealth,None,None,true));
+        let mut page=Page::new("continued-navigation".into(),context);
+        let mut requests=page.enable_interception();
+        let (result,())=tokio::join!(page.navigate("http://127.0.0.1:9/original"),async {
+            let request=tokio::time::timeout(std::time::Duration::from_secs(2),requests.recv()).await.unwrap().unwrap();
+            request.resolver.send(InterceptResolution::Continue {url:Some(target),method:Some("POST".into()),
+                headers:Some([("content-type".into(),"application/octet-stream".into()),("x-navigation".into(),"isolated".into())].into()),
+                body:Some(vec![0,255,128])}).ok().unwrap();
+        });
+        result.unwrap();server.await.unwrap();
+        assert_eq!(page.title,"continued");
+        assert_eq!(page.url_string(),"http://127.0.0.1:9/original","a network rewrite does not rewrite the document URL");
+        assert!(page.http_client.extra_headers.read().await.is_empty(),"per-request headers cannot leak to another page");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_interception_can_fail_without_contacting_transport() {
+        use obscura_js::ops::InterceptResolution;
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let context = Arc::new(BrowserContext::new("aborted-navigation".into()));
+        let mut page = Page::new("aborted-navigation".into(), context);
+        let mut requests = page.enable_interception();
+        let (result, ()) = tokio::join!(page.navigate("http://127.0.0.1:9/aborted"), async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(2), requests.recv()).await.unwrap().unwrap();
+            request.resolver.send(InterceptResolution::Fail {reason: "Aborted".into()}).ok().unwrap();
+        });
+        assert!(result.unwrap_err().to_string().contains("ERR_ABORTED"));
+        assert_eq!(page.lifecycle, LifecycleState::Failed);
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn blank_navigation_has_no_doctype_and_starts_in_quirks_mode() {

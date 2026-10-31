@@ -320,6 +320,23 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, request, callbacks, "GET", None, None).await
+    }
+
+    /// Continue a navigation without changing another page's headers or pool.
+    pub async fn fetch_navigation_request(
+        &self, url: &Url, method: &str, body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>, callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_request(url, ResourceRequest::navigation(), callbacks, method, body, headers).await
+    }
+
+    async fn fetch_request(
+        &self, url: &Url, request: ResourceRequest, callbacks: Option<&CallbackRegistry>,
+        method: &str, mut body: Option<Vec<u8>>, mut request_headers: Option<HashMap<String, String>>,
+    ) -> Result<Response, ObscuraNetError> {
+        let mut method = wreq::Method::from_bytes(method.as_bytes())
+            .map_err(|error| ObscuraNetError::Network(error.to_string()))?;
         validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
@@ -347,7 +364,7 @@ impl StealthHttpClient {
         // 21 requests, so the 20th hop is followed and only the 21st fails.
         for _ in 0..=20 {
             validate_request_mode(&request, &current_url)?;
-            let mut req = self.client.get(current_url.as_str());
+            let mut req = self.client.request(method.clone(), current_url.as_str());
 
             req = req
                 .header("accept", request.accept())
@@ -380,7 +397,10 @@ impl StealthHttpClient {
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            let extra_headers = self.extra_headers.read().await;
+            let supplied = request_headers.as_ref();
+            let effective_headers = supplied.unwrap_or(&extra_headers);
+            for (k, v) in effective_headers.iter() {
                 if k.eq_ignore_ascii_case("origin") {
                     continue;
                 }
@@ -392,10 +412,18 @@ impl StealthHttpClient {
 
             let request_info = RequestInfo {
                 url: current_url.clone(),
-                method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                method: method.to_string(),
+                headers: effective_headers.clone(),
                 resource_type: request.resource_type,
             };
+
+            if let Some(bytes) = &body {
+                if method == wreq::Method::POST && !effective_headers.keys().any(|name| name.eq_ignore_ascii_case("content-type")) {
+                    req = req.header("content-type", "application/x-www-form-urlencoded");
+                }
+                req = req.body(bytes.clone());
+            }
+            drop(extra_headers);
             if !request_callback_fired {
                 if let Some(callbacks) = callbacks {
                     callbacks.fire_request(&request_info).await;
@@ -404,8 +432,10 @@ impl StealthHttpClient {
             }
 
             let in_flight = InFlightGuard::new(&self.in_flight);
-            let resp = send_get_with_connection_reset_retry(req, &current_url)
-                .await
+            let resp = if method == wreq::Method::GET {
+                send_get_with_connection_reset_retry(req, &current_url).await
+            } else { req.send().await }
+
                 .map_err(|e| {
                     ObscuraNetError::Network(format!("{}: {}", current_url, error_chain(&e)))
                 })?;
@@ -447,8 +477,21 @@ impl StealthHttpClient {
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
+                    if next_url.origin() != current_url.origin() {
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                        }
+                    }
                     redirects.push(current_url.clone());
                     current_url = next_url;
+                    if (status.as_u16() == 303 && method != wreq::Method::GET && method != wreq::Method::HEAD)
+                        || (matches!(status.as_u16(), 301 | 302) && method == wreq::Method::POST) {
+                        method = wreq::Method::GET; body = None;
+                        if let Some(headers) = request_headers.as_mut() {
+                            headers.retain(|name, _| !matches!(name.to_ascii_lowercase().as_str(),
+                                "content-type" | "content-encoding" | "content-language" | "content-location" | "content-length"));
+                        }
+                    }
                     continue;
                 }
             }
