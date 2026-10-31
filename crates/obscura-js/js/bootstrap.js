@@ -8512,6 +8512,27 @@ function _arrayBufferFromBytes(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
+async function _readResponseStream(stream) {
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (Object.prototype.toString.call(value) !== '[object Uint8Array]') {
+        throw new TypeError('Response body stream must contain Uint8Array chunks');
+      }
+      const chunk = value.slice();
+      chunks.push(chunk); total += chunk.byteLength;
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes;
+}
+
 function _installWasmStreamingFallback() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
@@ -9197,7 +9218,10 @@ if (typeof Response === 'undefined') {
       } else if (this.status === 204 || this.status === 205 || this.status === 304) {
         body = null;
       }
-      this._bodyBytes = _bodyToUint8Array(body);
+      const stream = typeof ReadableStream === 'function' && body instanceof ReadableStream ? body : null;
+      if (stream && (stream.locked || stream._disturbed)) throw new TypeError('Body stream is locked or disturbed');
+      if (stream) this._streamSource = stream;
+      this._bodyBytes = stream ? new Uint8Array() : _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(headers);
       this.type = internal ? (init.type || 'default') : 'default';
@@ -9214,11 +9238,12 @@ if (typeof Response === 'undefined') {
       this._bodyAbortReason = undefined;
     }
     _consumeBody() {
-      if (this._bodyUsed) throw new TypeError("Body is already consumed");
+      if (this.bodyUsed || this._streamSource?.locked || this._bodyStream?.locked) throw new TypeError("Body is already consumed or locked");
       this._bodyUsed = true;
       if (this._bodyAborted) throw this._bodyAbortReason;
     }
     get body() {
+      if (this._streamSource) return this._streamSource;
       if (this._bodyNull) return null;
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
       if (!this._bodyStream) {
@@ -9239,15 +9264,16 @@ if (typeof Response === 'undefined') {
             }
           },
         });
-        // bodyUsed flips the moment the stream is locked for reading
-        // (spec: the body becomes "disturbed"), which no state probe can
-        // observe on a native ReadableStream, so hook getReader instead.
+        // Locking alone does not disturb a body; reading or cancelling does.
         const response = this;
         const stream = this._bodyStream;
         const getReader = stream.getReader.bind(stream);
         stream.getReader = function () {
-          response._bodyUsed = true;
-          return getReader();
+          const reader = getReader();
+          const read = reader.read.bind(reader), cancel = reader.cancel.bind(reader);
+          reader.read = function () { response._bodyUsed = true; return read(); };
+          reader.cancel = function (reason) { response._bodyUsed = true; return cancel(reason); };
+          return reader;
         };
         stream.releaseLock = function () {
           response._bodyUsed = true;
@@ -9256,12 +9282,19 @@ if (typeof Response === 'undefined') {
       }
       return this._bodyStream;
     }
-    get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    get bodyUsed() { return this._bodyUsed || !!this._streamSource?._disturbed; }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._streamSource ? await _readResponseStream(this._streamSource) : this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
     clone() {
+      if (this.bodyUsed || this._streamSource?.locked || this._bodyStream?.locked) throw new TypeError('Body is already consumed or locked');
+      if (this._streamSource) {
+        const [left, right] = this._streamSource.tee();
+        this._streamSource = left;
+        return _createInternalResponse(right, {status: this.status, statusText: this.statusText,
+          headers: this.headers, type: this.type, url: this.url, redirected: this.redirected});
+      }
       const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {
         const promise = this._fetchBody.promise.then(bytes => bytes.slice());
@@ -16928,6 +16961,12 @@ if (typeof ReadableStream === 'undefined') {
       this._state = "readable";
       this._error = null;
       this.locked = false;
+      this._disturbed = false;
+      this._started = false;
+      this._pulling = false;
+      this._pullAgain = false;
+      this._highWaterMark = strategy.highWaterMark === undefined ? 1 : Number(strategy.highWaterMark);
+      if (Number.isNaN(this._highWaterMark) || this._highWaterMark < 0) throw new RangeError('Invalid highWaterMark');
       const stream = this;
       this._controller = {
         enqueue(chunk) {
@@ -16935,6 +16974,7 @@ if (typeof ReadableStream === 'undefined') {
           const pending = stream._reads.shift();
           if (pending) pending.resolve({value: chunk, done: false});
           else stream._queue.push(chunk);
+          stream._pullIfNeeded();
         },
         close() {
           if (stream._state !== "readable") return;
@@ -16954,16 +16994,27 @@ if (typeof ReadableStream === 'undefined') {
           while (stream._reads.length) stream._reads.shift().reject(error);
           while (stream._closedWaiters.length) stream._closedWaiters.shift().reject(error);
         },
-        get desiredSize() { return Math.max(0, 1 - stream._queue.length); },
+        get desiredSize() { return stream._highWaterMark - stream._queue.length; },
       };
       try {
         const started = source.start?.(this._controller);
         if (started && typeof started.then === "function") {
-          started.catch((error) => this._controller.error(error));
+          Promise.resolve(started).then(() => { this._started = true; this._pullIfNeeded(); }, (error) => this._controller.error(error));
+        } else {
+          this._started = true;
+          if (typeof source.pull === 'function') queueMicrotask(() => this._pullIfNeeded());
         }
-      } catch (error) {
-        this._controller.error(error);
-      }
+      } catch (error) { this._controller.error(error); }
+    }
+    _pullIfNeeded() {
+      if (!this._started || this._state !== 'readable' || this._closeRequested || typeof this._source.pull !== 'function'
+          || (!this._reads.length && this._controller.desiredSize <= 0)) return;
+      if (this._pulling) { this._pullAgain = true; return; }
+      this._pulling = true;
+      Promise.resolve().then(() => this._source.pull(this._controller)).then(() => {
+        this._pulling = false;
+        if (this._pullAgain) { this._pullAgain = false; this._pullIfNeeded(); }
+      }, error => { this._pulling = false; this._controller.error(error); });
     }
     getReader() {
       if (this.locked) throw new TypeError("ReadableStream is locked");
@@ -16972,14 +17023,16 @@ if (typeof ReadableStream === 'undefined') {
       let closedPromise;
       return {
         read() {
+          stream._disturbed = true;
           if (stream._queue.length > 0) {
             const value = stream._queue.shift();
             if (!stream._queue.length && stream._closeRequested) stream._controller.close();
+            stream._pullIfNeeded();
             return Promise.resolve({ value, done: false });
           }
           if (stream._state === "closed") return Promise.resolve({ value: undefined, done: true });
           if (stream._state === "errored") return Promise.reject(stream._error);
-          return new Promise((resolve, reject) => stream._reads.push({resolve, reject}));
+          return new Promise((resolve, reject) => { stream._reads.push({resolve, reject}); stream._pullIfNeeded(); });
         },
         releaseLock() { stream.locked = false; },
         cancel(reason) { return stream.cancel(reason); },
@@ -16997,6 +17050,7 @@ if (typeof ReadableStream === 'undefined') {
       };
     }
     cancel(reason) {
+      this._disturbed = true;
       if (this._state === "errored") return Promise.reject(this._error);
       this._queue.length = 0;
       if (this._state === "closed") return Promise.resolve();
@@ -17029,27 +17083,43 @@ if (typeof ReadableStream === 'undefined') {
       return transform.readable;
     }
     tee() {
-      let leftController;
-      let rightController;
-      const left = new ReadableStream({start(controller) { leftController = controller; }});
-      const right = new ReadableStream({start(controller) { rightController = controller; }});
-      (async () => {
-        try {
-          const reader = this.getReader();
-          while (true) {
-            const {value, done} = await reader.read();
-            if (done) break;
-            leftController.enqueue(value);
-            rightController.enqueue(value);
-          }
-          leftController.close();
-          rightController.close();
-        } catch (error) {
-          leftController.error(error);
-          rightController.error(error);
+      const reader = this.getReader(), controllers = [], cancelled = [false, false], reasons = [];
+      let reading = null, finished = false, completeCancel, rejectCancel;
+      const cancellation = new Promise((resolve, reject) => { completeCancel = resolve; rejectCancel = reject; });
+      cancellation.catch(() => {});
+      const errorBranches = error => {
+        if (finished) return;
+        finished = true;
+        for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].error(error);
+        reader.releaseLock(); completeCancel();
+      };
+      reader.closed.catch(errorBranches);
+      const pull = () => {
+        if (!reading && !finished) {
+          reading = reader.read().then(({value, done}) => {
+            if (finished) return;
+            if (done) {
+              finished = true;
+              for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].close();
+              reader.releaseLock(); completeCancel();
+            } else {
+              for (let i = 0; i < 2; i++) if (!cancelled[i]) controllers[i].enqueue(value);
+            }
+          }, errorBranches).finally(() => { reading = null; });
         }
-      })();
-      return [left, right];
+        return reading;
+      };
+      return [0, 1].map(index => new ReadableStream({
+        start(controller) { controllers[index] = controller; }, pull,
+        cancel(reason) {
+          cancelled[index] = true; reasons[index] = reason;
+          if (cancelled[0] && cancelled[1]) {
+            finished = true;
+            Promise.resolve(reader.cancel(reasons)).then(completeCancel, rejectCancel).finally(() => reader.releaseLock());
+          }
+          return cancellation;
+        },
+      }));
     }
     [Symbol.asyncIterator]() {
       const reader = this.getReader();
