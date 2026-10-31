@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 Patch rusty_v8 build.rs for Android cross-compilation:
+- Ensures V8_FROM_SOURCE only applies to the cross-compilation target (Android),
+  so host build dependencies (obscura-js build.rs) use fast prebuilt binaries.
 - Option 1 (Rebuild mode): Configures Clang bindgen with Android target & NDK sysroot.
-- Option 2 (Fast mode): Bypasses bindgen by using the pre-generated binary-compatible aarch64 Linux bindings.
+- Option 2 (Fast mode): Bypasses bindgen by using pre-generated binary-compatible bindings.
 """
 
 import sys
 import os
+import re
 from pathlib import Path
 
 
@@ -17,9 +20,9 @@ def patch_v8_build_rs(build_rs_path: str):
         return False
 
     content = p.read_text(encoding="utf-8")
-    modified = False
+    original = content
 
-    # 1. Patch static_lib_url for Android
+    # 1. Patch static_lib_url for Android (only override for target, not host)
     old_static_url = '''fn static_lib_url() -> String {
   if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {
     return custom_archive;
@@ -34,7 +37,6 @@ def patch_v8_build_rs(build_rs_path: str):
   }'''
     if old_static_url in content:
         content = content.replace(old_static_url, new_static_url, 1)
-        modified = True
 
     # 2. Patch print_prebuilt_src_binding_path for Android
     old_print_binding = '''fn print_prebuilt_src_binding_path() {
@@ -53,31 +55,65 @@ def patch_v8_build_rs(build_rs_path: str):
   }'''
     if old_print_binding in content:
         content = content.replace(old_print_binding, new_print_binding, 1)
-        modified = True
 
-    # 3. Patch build_binding entry for Option 2 (Pre-generated bindings bypass)
-    old_entry = "fn build_binding() {"
+    # 3. Patch V8_FROM_SOURCE so host dependencies NEVER build from source
+    old_from_source = '  // Build from source\n  if env_bool("V8_FROM_SOURCE") {'
+    new_from_source = '''  // Build from source (only for Android or cross-compilation target; host uses prebuilts)
+  let target = env::var("TARGET").unwrap_or_default();
+  let host = env::var("HOST").unwrap_or_default();
+  let is_cross_target = target.contains("android") || target != host;
+  if env_bool("V8_FROM_SOURCE") && is_cross_target {'''
+    if old_from_source in content:
+        content = content.replace(old_from_source, new_from_source, 1)
+
+    # 4. Patch build_binding entry for Option 2 (Pre-generated bindings bypass for Android & Host Linux)
+    # Match either original build_binding() or previously patched build_binding()
     new_entry = """fn build_binding() {
   let out_path = build_dir().join("gn_out").join("src_binding.rs");
   let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
   let rebuild_mode = env::var("OBSCURA_REBUILD_V8").unwrap_or_default() == "1";
 
-  // Option 2 (Default): Pre-generated aarch64 Linux bindings (100% ABI compatible, instant, bypasses bindgen)
-  if target_os == "android" && !rebuild_mode {
-    let prebuilt = get_dirs().root.join("gen").join("src_binding_release_aarch64-unknown-linux-gnu.rs");
-    if prebuilt.exists() {
-      println!("⚡ [Option 2] Using pre-generated aarch64 bindings for Android (bypassing bindgen)");
-      std::fs::create_dir_all(out_path.parent().unwrap()).ok();
-      std::fs::copy(&prebuilt, &out_path).expect("Failed to copy prebuilt aarch64 binding");
-      println!("cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={}", out_path.display());
-      return;
+  // Option 2 (Default): Pre-generated bindings bypass (100% ABI compatible, instant, bypasses bindgen)
+  if !rebuild_mode {
+    let binding_file = if target_os == "android" {
+      Some("src_binding_release_aarch64-unknown-linux-gnu.rs")
+    } else if target_os == "linux" {
+      if target_arch == "aarch64" {
+        Some("src_binding_release_aarch64-unknown-linux-gnu.rs")
+      } else if target_arch == "x86_64" {
+        Some("src_binding_release_x86_64-unknown-linux-gnu.rs")
+      } else {
+        None
+      }
+    } else {
+      None
+    };
+
+    if let Some(file_name) = binding_file {
+      let prebuilt = get_dirs().root.join("gen").join(file_name);
+      if prebuilt.exists() {
+        println!("⚡ [Option 2] Using pre-generated bindings for {target_os}-{target_arch} (bypassing bindgen)");
+        std::fs::create_dir_all(out_path.parent().unwrap()).ok();
+        std::fs::copy(&prebuilt, &out_path).expect("Failed to copy prebuilt binding");
+        println!("cargo:rustc-env=RUSTY_V8_SRC_BINDING_PATH={}", out_path.display());
+        return;
+      }
     }
   }"""
-    if old_entry in content and "OBSCURA_REBUILD_V8" not in content:
-        content = content.replace(old_entry, new_entry, 1)
-        modified = True
 
-    # 4. Patch build_binding target branch for Option 1 (Full Clang NDK sysroot bindgen)
+    # If already patched with earlier Option 2 pattern, replace it with new generalized pattern
+    if '⚡ [Option 2] Using pre-generated aarch64 bindings for Android' in content:
+        content = re.sub(
+            r'fn build_binding\(\)\s*\{[\s\S]*?(?=  // Bindgen needs Clang 19\+)',
+            new_entry + "\n",
+            content,
+            count=1
+        )
+    elif "fn build_binding() {" in content and "OBSCURA_REBUILD_V8" not in content:
+        content = content.replace("fn build_binding() {", new_entry, 1)
+
+    # 5. Patch build_binding target branch for Option 1 (Full Clang NDK sysroot bindgen)
     old_ios = '  } else if target_os == "ios" {'
     new_android = """  } else if target_os == "android" {
     // Option 1 (Rebuild): Full Clang bindgen with Android NDK sysroot
@@ -108,14 +144,13 @@ def patch_v8_build_rs(build_rs_path: str):
   } else if target_os == "ios" {"""
     if old_ios in content and "Option 1 (Rebuild)" not in content:
         content = content.replace(old_ios, new_android, 1)
-        modified = True
 
-    if modified:
+    if content != original:
         p.write_text(content, encoding="utf-8")
-        print(f"✅ Successfully patched {p} with Option 1 & Option 2 support for Android.")
+        print(f"✅ Successfully patched {p} with Option 1 & Option 2 (Target & Host) support.")
         return True
     else:
-        print(f"ℹ️ {p} was already patched.")
+        print(f"ℹ️ {p} was already up-to-date.")
         return False
 
 
@@ -135,4 +170,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
