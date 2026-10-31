@@ -468,7 +468,7 @@ Fetch and render a single page.
 |------|---------|-------------|
 | `--dump` | `html` | Output: `html`, `text`, `links`, `markdown`, `assets` (NDJSON of every sub-resource URL the page references), or `original` (raw response body) |
 | `--eval` | — | JavaScript expression to evaluate |
-| `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0` |
+| `--wait-until` | `load` | Wait: `load`, `domcontentloaded`, `networkidle0`. Network idle counts normal and stealth requests and requires a 500 ms quiet window within `--timeout`; an expired deadline is an error. |
 | `--timeout` | `30` | Maximum navigation time in seconds |
 | `--wait` | adaptive, up to `5` | Post-load settling; an explicit value is a fixed delay in seconds |
 | `--selector` | — | Wait for CSS selector |
