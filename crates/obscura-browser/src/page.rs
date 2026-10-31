@@ -3437,6 +3437,7 @@ impl Page {
                 "file:// navigation is disabled for this browser context: {url_str}"
             )));
         }
+        let deadline = tokio::time::Instant::now() + self.navigation_timeout();
         self.network_events.clear();
         let mut current_url = url_str.to_string();
         let mut current_method = method.to_string();
@@ -3450,6 +3451,7 @@ impl Page {
                 &current_method,
                 &current_body,
                 &document_referrer,
+                deadline,
             )
             .await?;
             if let Some((next_url, next_method, next_body)) = self.take_pending_navigation() {
@@ -3506,6 +3508,7 @@ impl Page {
         method: &str,
         body: &str,
         referrer: &str,
+        deadline: tokio::time::Instant,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
         self.navigation_timing = NavigationTiming::default();
@@ -3794,27 +3797,30 @@ impl Page {
                 _ => 0,
             };
 
-            self.wait_for_network_idle(threshold).await;
+            self.wait_for_network_idle_until(threshold, deadline).await?;
         }
 
         Ok(())
     }
 
-    async fn wait_for_network_idle(&mut self, threshold: u32) {
-        // Same hazard as the post-script settle: a synchronous poll can pin
-        // the thread past the 5s network-idle deadline, so arm a watchdog
-        // that terminates the isolate ~500ms past it.
-        let netidle_wd = self
-            .js
-            .as_mut()
-            .map(|js| js.arm_watchdog(std::time::Duration::from_millis(5500)));
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    #[cfg(test)]
+    async fn wait_for_network_idle(&mut self, threshold: u32) -> Result<(), PageError> {
+        let deadline = tokio::time::Instant::now() + self.navigation_timeout();
+        self.wait_for_network_idle_until(threshold, deadline).await
+    }
+
+    async fn wait_for_network_idle_until(&mut self, threshold: u32, deadline: tokio::time::Instant) -> Result<(), PageError> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let netidle_wd = self.js.as_mut().map(|js| js.arm_watchdog(remaining));
         let mut idle_since: Option<tokio::time::Instant> = None;
 
-        loop {
+        let reached_idle = loop {
             let active = self.http_client.active_requests();
+            #[cfg(feature = "stealth")]
+            let active = active + self.stealth_client.as_ref().map_or(0, |client| client.active_requests());
             let now = tokio::time::Instant::now();
 
+            if now >= deadline { break false; }
             if active <= threshold {
                 if idle_since.is_none() {
                     idle_since = Some(now);
@@ -3822,18 +3828,10 @@ impl Page {
                 if now.duration_since(idle_since.unwrap())
                     >= tokio::time::Duration::from_millis(500)
                 {
-                    break;
+                    break true;
                 }
             } else {
                 idle_since = None;
-            }
-
-            if now >= deadline {
-                tracing::debug!(
-                    "Network idle timeout reached with {} active requests",
-                    active
-                );
-                break;
             }
 
             // An idle runtime can stay parked. Wake at the existing quiet
@@ -3857,14 +3855,21 @@ impl Page {
                     std::future::pending::<()>(),
                 ).await;
             }
-        }
+        };
 
+        let mut terminated = false;
         if let Some(token) = netidle_wd {
             if let Some(js) = self.js.as_mut() {
-                js.disarm_watchdog(token);
+                terminated = js.disarm_watchdog(token);
             }
         }
-        self.lifecycle = LifecycleState::NetworkIdle;
+        if reached_idle && !terminated {
+            self.lifecycle = LifecycleState::NetworkIdle;
+            Ok(())
+        } else {
+            self.lifecycle = LifecycleState::Failed;
+            Err(PageError::NetworkError("network idle exceeded the navigation deadline".into()))
+        }
     }
 
     /// Builds the child frames of the document that just loaded.
@@ -5367,7 +5372,7 @@ mod tests {
         "#).unwrap();
         let started = tokio::time::Instant::now();
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
-            .await.expect("quiet page must finish within its normal window");
+            .await.expect("quiet page must finish within its normal window").expect("network idle reached");
         assert!(started.elapsed() >= std::time::Duration::from_millis(500));
         assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
         assert_eq!(page.js.as_mut().unwrap().evaluate("[__idleTicks, __idleObserved]").unwrap(),
@@ -5411,7 +5416,7 @@ mod tests {
         assert_eq!(page.http_client.active_requests(), 2);
         let started = tokio::time::Instant::now();
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(2))
-            .await.expect("two active requests must not force the five-second deadline");
+            .await.expect("two active requests must not force the five-second deadline").expect("network idle reached");
         assert!(started.elapsed() >= std::time::Duration::from_millis(500));
         assert_eq!(page.http_client.active_requests(), 2, "threshold two must allow both held requests");
         release_a.send(()).unwrap();
@@ -5433,7 +5438,7 @@ mod tests {
             *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
-            .await.expect("completed request must permit network idle");
+            .await.expect("completed request must permit network idle").expect("network idle reached");
         release_task.await.unwrap();
         assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
             "an active request must prevent an earlier quiet-window start");
@@ -5455,25 +5460,84 @@ mod tests {
             *recorded.lock().unwrap() = Some(tokio::time::Instant::now());
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), page.wait_for_network_idle(0))
-            .await.expect("a completed late request must permit network idle");
+            .await.expect("a completed late request must permit network idle").expect("network idle reached");
         request_task.await.unwrap();
         assert!(completed.lock().unwrap().unwrap().elapsed() >= std::time::Duration::from_millis(490),
             "new traffic must reset the original quiet window");
     }
 
+    #[cfg(feature = "stealth")]
     #[tokio::test(flavor = "current_thread")]
-    async fn network_idle_keeps_five_second_deadline_for_stuck_request() {
+    async fn network_idle_counts_active_stealth_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "stealth-idle".into(), None, true, None, None, true,
+        ));
+        let mut page = super::Page::new("stealth-idle".into(), context);
+        page.set_navigation_timeout(std::time::Duration::from_millis(700));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let read = socket.read(&mut bytes).await.unwrap();
+                assert!(read > 0 && request.len() < 16384);
+                request.extend_from_slice(&bytes[..read]);
+            }
+            ready_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+        });
+        let client = page.stealth_client.as_ref().unwrap().clone();
+        let request = tokio::spawn(async move { client.fetch(&url).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await.unwrap().unwrap();
+        assert_eq!(page.http_client.active_requests(), 0);
+        assert_eq!(page.stealth_client.as_ref().unwrap().active_requests(), 1);
+        let result = page.wait_for_network_idle(0).await;
+        release_tx.send(()).unwrap();
+        assert_eq!(request.await.unwrap().status, 200);
+        server.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_uses_navigation_deadline_without_reporting_false_idle() {
         let mut page = network_idle_test_page();
+        page.set_navigation_timeout(std::time::Duration::from_millis(80));
         let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
-        let started = tokio::time::Instant::now();
-        tokio::time::timeout(std::time::Duration::from_secs(7), page.wait_for_network_idle(0))
-            .await.expect("network-idle deadline must still finish");
-        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), page.wait_for_network_idle(0))
+            .await.expect("configured deadline must finish");
+        assert!(result.unwrap_err().to_string().contains("deadline"));
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::Failed);
         assert_eq!(page.http_client.active_requests(), 1);
-        release.send(()).unwrap();
-        fetch.await.unwrap();
+        release.send(()).unwrap();fetch.await.unwrap();
         assert_eq!(page.js.as_mut().unwrap().evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_idle_does_not_stop_at_five_seconds_when_budget_remains() {
+        use std::future::Future;
+        let mut page = network_idle_test_page();
+        page.set_navigation_timeout(std::time::Duration::from_secs(8));
+        let (release, fetch) = network_idle_held_request(page.http_client.clone()).await;
+        tokio::time::pause();
+        let mut wait = Box::pin(page.wait_for_network_idle(0));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(wait.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(wait.as_mut().poll(&mut context).is_pending(), "five seconds is not a successful idle result");
+        tokio::time::resume();release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait).await.unwrap().unwrap();
+        fetch.await.unwrap();
+        assert_eq!(page.lifecycle, crate::lifecycle::LifecycleState::NetworkIdle);
+    }
+
     fn install_linked_stylesheet(
         runtime: &mut obscura_js::runtime::ObscuraJsRuntime,
         index: usize,
