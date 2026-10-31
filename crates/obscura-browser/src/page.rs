@@ -1112,7 +1112,7 @@ impl Page {
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 context.allow_private_network,
-            );
+            ).with_user_agent(context.user_agent_override.clone());
             client.allow_file_access = context.allow_file_access;
             Some(Arc::new(client))
         } else {
@@ -1935,7 +1935,7 @@ impl Page {
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
+            rt.set_user_agent(self.context.user_agent_override.as_deref().unwrap_or(obscura_net::STEALTH_USER_AGENT));
             rt.set_platform(
                 obscura_net::STEALTH_NAVIGATOR_PLATFORM,
                 obscura_net::STEALTH_UA_PLATFORM,
@@ -5222,6 +5222,17 @@ mod tests {
     use base64::Engine as _;
     use std::sync::Arc;
     use obscura_dom::parse_html;
+
+    #[cfg(feature = "stealth")]
+    #[test]
+    fn stealth_navigator_uses_the_explicit_context_user_agent() {
+        let context=std::sync::Arc::new(crate::BrowserContext::with_storage_and_network("stealth-identity".into(),None,true,Some("TestingUA/1.0".into()),None,false));
+        let mut page=super::Page::new("stealth-identity".into(),context);
+        page.url=Some(url::Url::parse("https://example.test/").unwrap());
+        page.dom=Some(parse_html("<html><body></body></html>"));page.init_js();
+        assert_eq!(page.evaluate_script("navigator.userAgent").unwrap(),serde_json::json!("TestingUA/1.0"));
+    }
+
 
     #[tokio::test(flavor = "current_thread")]
     async fn navigation_interception_fulfills_before_transport_and_preserves_bytes() {
