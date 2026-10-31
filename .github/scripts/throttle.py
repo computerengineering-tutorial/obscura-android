@@ -24,7 +24,7 @@ def format_size(num_bytes):
     return f"{num_bytes:.1f} TB"
 
 
-def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_lines=50, is_shell=False):
+def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_lines=100, is_shell=False, log_file=None):
     start_time = time.time()
     last_line = ""
     last_printed_status = None
@@ -32,6 +32,15 @@ def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_l
     recent_lines = deque(maxlen=tail_lines)
     stop_event = threading.Event()
     lbl = label or "Task"
+    log_fp = None
+    if log_file:
+        try:
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            log_fp = open(log_file, "w", encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"⚠️ Could not open log file {log_file}: {e}", file=sys.stderr)
 
     if cmd_args and cmd_args[0] == "--":
         cmd_args = cmd_args[1:]
@@ -67,6 +76,9 @@ def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_l
         nonlocal last_line
         try:
             for line in proc.stdout:
+                if log_fp:
+                    log_fp.write(line)
+                    log_fp.flush()
                 cleaned = line.rstrip()
                 if cleaned:
                     with line_lock:
@@ -74,6 +86,12 @@ def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_l
                         recent_lines.append(cleaned)
         except Exception:
             pass
+        finally:
+            if log_fp:
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
 
     t_reader = threading.Thread(target=reader, daemon=True)
     t_reader.start()
@@ -118,6 +136,23 @@ def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_l
         return 0
     else:
         print(f"\n❌ [{lbl}] FAILED with code {proc.returncode} after {mins}m {secs}s!", flush=True)
+        if log_file and os.path.exists(log_file):
+            print(f"📄 Full raw logs captured at: {log_file} ({format_size(os.path.getsize(log_file))})", flush=True)
+            try:
+                error_lines = []
+                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                    for l in f:
+                        if any(marker in l for marker in ["error:", "FAILED:", "fatal error:", "undefined reference", "cargo:warning"]):
+                            error_lines.append(l.rstrip())
+                if error_lines:
+                    print(f"====== First {min(len(error_lines), 25)} Detected Compiler Errors ======", flush=True)
+                    for err in error_lines[:25]:
+                        print(err, flush=True)
+                    if len(error_lines) > 25:
+                        print(f"... and {len(error_lines) - 25} more errors found in {log_file}", flush=True)
+                    print("================================================================", flush=True)
+            except Exception:
+                pass
         print(f"====== Last {len(recent_lines)} lines of logs ======", flush=True)
         for l in list(recent_lines):
             print(l, flush=True)
@@ -125,7 +160,7 @@ def run_throttled(cmd_args, interval=30.0, label="Task", watch_file=None, tail_l
         return proc.returncode
 
 
-def run_stdin_throttled(interval=30.0, label="Task", watch_file=None, tail_lines=50):
+def run_stdin_throttled(interval=30.0, label="Task", watch_file=None, tail_lines=100, log_file=None):
     start_time = time.time()
     last_line = ""
     last_printed_status = None
@@ -133,6 +168,15 @@ def run_stdin_throttled(interval=30.0, label="Task", watch_file=None, tail_lines
     recent_lines = deque(maxlen=tail_lines)
     stop_event = threading.Event()
     lbl = label or "Task"
+    log_fp = None
+    if log_file:
+        try:
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            log_fp = open(log_file, "w", encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"⚠️ Could not open log file {log_file}: {e}", file=sys.stderr)
 
     print(f"🚀 [{lbl}] Started reading stdin (Log interval: {interval}s).", flush=True)
 
@@ -140,6 +184,9 @@ def run_stdin_throttled(interval=30.0, label="Task", watch_file=None, tail_lines
         nonlocal last_line
         try:
             for line in iter(sys.stdin.readline, ""):
+                if log_fp:
+                    log_fp.write(line)
+                    log_fp.flush()
                 cleaned = line.rstrip()
                 if cleaned:
                     with line_lock:
@@ -147,6 +194,12 @@ def run_stdin_throttled(interval=30.0, label="Task", watch_file=None, tail_lines
                         recent_lines.append(cleaned)
         except Exception:
             pass
+        finally:
+            if log_fp:
+                try:
+                    log_fp.close()
+                except Exception:
+                    pass
         stop_event.set()
 
     t_reader = threading.Thread(target=reader, daemon=True)
@@ -201,7 +254,10 @@ def main():
         "-w", "--watch-file", type=str, default=None, help="Optional file to monitor size during execution"
     )
     parser.add_argument(
-        "-n", "--tail-lines", type=int, default=50, help="Lines of output to show on failure (default: 50)"
+        "-n", "--tail-lines", type=int, default=100, help="Lines of output to show on failure (default: 100)"
+    )
+    parser.add_argument(
+        "--log-file", type=str, default=None, help="File path to save full unfiltered build logs"
     )
     parser.add_argument(
         "-c", "--shell-cmd", type=str, default=None, help="Execute string command inside bash shell"
@@ -218,6 +274,7 @@ def main():
             watch_file=args.watch_file,
             tail_lines=args.tail_lines,
             is_shell=True,
+            log_file=args.log_file,
         )
         sys.exit(code)
     elif args.cmd and (len(args.cmd) > 1 or (len(args.cmd) == 1 and args.cmd[0] != "--")):
@@ -229,6 +286,7 @@ def main():
             watch_file=args.watch_file,
             tail_lines=args.tail_lines,
             is_shell=False,
+            log_file=args.log_file,
         )
         sys.exit(code)
     else:
@@ -237,6 +295,7 @@ def main():
             label=args.label,
             watch_file=args.watch_file,
             tail_lines=args.tail_lines,
+            log_file=args.log_file,
         )
         sys.exit(code)
 

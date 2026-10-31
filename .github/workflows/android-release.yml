@@ -25,6 +25,7 @@ jobs:
       LIBCLANG_PATH: /usr/lib/llvm-21/lib
       SCCACHE_DIR: /home/runner/.cache/sccache
       SCCACHE_CACHE_SIZE: 10G
+      SCCACHE_IDLE_TIMEOUT: "0"
       # Disable internal Chromium Rust submodules & Temporal, provide NDK version for clean C++ V8 build
       GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
       EXTRA_GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
@@ -82,7 +83,7 @@ jobs:
           echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" | sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-jammy-21.list
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake clang-21 libclang-21-dev lld-21 llvm-21-dev ninja-build pkg-config libglib2.0-dev unzip
+          sudo apt-get install -y --no-install-recommends cmake clang-21 libclang-21-dev lld-21 llvm-21-dev ninja-build pkg-config libglib2.0-dev unzip zip
           echo "LIBCLANG_PATH=/usr/lib/llvm-21/lib" >> $GITHUB_ENV
           sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100 || true
           sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100 || true
@@ -108,6 +109,8 @@ jobs:
           if [ -n "$SCCACHE_BIN" ]; then
             echo "SCCACHE=$SCCACHE_BIN" >> $GITHUB_ENV
             echo "Configured SCCACHE=$SCCACHE_BIN"
+            sudo ln -sf "$SCCACHE_BIN" /usr/local/bin/sccache || true
+            sudo ln -sf "$SCCACHE_BIN" /usr/bin/sccache || true
           fi
 
       # ---------------- Caching Layer 3: Cargo Cache (Registry & Git) ----------------
@@ -195,6 +198,42 @@ jobs:
             fi
           fi
           ls -lh ~/.cache/obscura-v8-prebuilt/ || true
+
+      # ---------------- Caching Layer 6.7: V8 Incremental Resume Checkpoint ----------------
+      - name: Restore V8 incremental build checkpoint
+        uses: actions/cache/restore@v6.1.0
+        id: restore-v8-checkpoint
+        with:
+          path: |
+            target/aarch64-linux-android/release/build/v8-*
+            target/release/build/v8-*
+            target/aarch64-linux-android/release/.fingerprint/v8-*
+            target/release/.fingerprint/v8-*
+            ~/.cache/v8-resume-checkpoint.zip
+          key: v8-checkpoint-aarch64-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            v8-checkpoint-aarch64-android-${{ runner.os }}-${{ github.run_id }}-
+            v8-checkpoint-aarch64-android-${{ runner.os }}-
+
+      - name: Unpack and prepare V8 incremental checkpoint
+        run: |
+          mkdir -p target
+          CHECKPOINT_ZIP="$HOME/.cache/v8-resume-checkpoint.zip"
+          if [ -s "$CHECKPOINT_ZIP" ]; then
+            echo "📦 Restoring V8 build state from checkpoint zip: $CHECKPOINT_ZIP..."
+            unzip -o -q "$CHECKPOINT_ZIP" -d . || true
+          fi
+
+          EXISTING_OBJS=$(find target/ -name "*.o" 2>/dev/null | wc -l)
+          if [ "$EXISTING_OBJS" -gt 0 ]; then
+            echo "⚡ Found $EXISTING_OBJS existing V8 object files!"
+            echo "⚡ Updating timestamps of .o and .ninja_* files to preserve incremental progress..."
+            find target/ -name "*.o" -exec touch {} + 2>/dev/null || true
+            find target/ -name ".ninja_*" -exec touch {} + 2>/dev/null || true
+            echo "⚡ V8 incremental resume state is ready."
+          else
+            echo "ℹ️ No previous V8 checkpoint objects found. Build will start clean."
+          fi
 
       - name: Fetch crate dependencies, configure V8 for target, and inject ICU data
         run: |
@@ -315,14 +354,13 @@ jobs:
           LIBCLANG_PATH: /usr/lib/llvm-21/lib
           SCCACHE_DIR: /home/runner/.cache/sccache
           SCCACHE_CACHE_SIZE: 10G
+          SCCACHE_IDLE_TIMEOUT: "0"
           GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
           EXTRA_GN_ARGS: 'android_ndk_version="r26d" symbol_level=0 v8_symbol_level=0 blink_symbol_level=0 is_debug=false treat_warnings_as_errors=false enable_rust=false enable_rust_cxx=false v8_enable_temporal_support=false v8_enable_fast_mksnapshot=true cc_wrapper="sccache"'
           CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C opt-level=3 -C target-feature=+neon -C codegen-units=1 -C debuginfo=0 -C strip=symbols -C link-arg=-Wl,-O3 -C link-arg=-Wl,--gc-sections"
           OBSCURA_NO_SNAPSHOT: "1"
         run: |
           mkdir -p android/app/src/main/jniLibs
-          # Ensure any stale host libv8 build artifacts from previous failed runs are cleaned
-          rm -rf target/release/deps/libv8* target/release/build/v8-* target/release/build/obscura-js-*
           PREBUILT_DIR="$HOME/.cache/obscura-v8-prebuilt"
           ARCHIVE_FILE="$PREBUILT_DIR/librusty_v8_release_aarch64-linux-android.a.gz"
           BINDING_FILE="$PREBUILT_DIR/src_binding_release_aarch64-linux-android.rs"
@@ -338,16 +376,21 @@ jobs:
             unset V8_FROM_SOURCE
           else
             echo "⚠️ ========================================================"
-            echo "⚠️ No prebuilt V8 archive found. Compiling V8 from source."
+            echo "⚠️ Compiling V8 from source (or resuming from checkpoint)."
             echo "⚠️ ========================================================"
             export V8_FROM_SOURCE=1
+            RESUMED_O_COUNT=$(find target/ -name "*.o" 2>/dev/null | wc -l)
+            if [ "$RESUMED_O_COUNT" -gt 0 ]; then
+              echo "⚡ Resuming V8 build: detected $RESUMED_O_COUNT pre-compiled object files!"
+            fi
           fi
 
           # Native Ninja status format streamed via Cargo very-verbose mode (-vv)
           export NINJA_STATUS="[%f/%t (%p)] "
 
-          # Throttle high-frequency build logs to 1 line every 30s to keep GitHub Actions UI responsive
-          python3 .github/scripts/throttle.py --interval 30 --label "Build Android JNI & V8" -- \
+          # Throttle high-frequency build logs to 1 line every 30s to keep GitHub Actions UI responsive,
+          # and simultaneously stream full logs into v8_build.log for checkpoint & diagnostics
+          python3 .github/scripts/throttle.py --interval 30 --label "Build Android JNI & V8" --log-file v8_build.log -- \
             cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release -p obscura-android -vv
 
       - name: Verify native library
@@ -365,6 +408,7 @@ jobs:
         run: |
           sccache --stop-server || true
           mkdir -p ~/.cache/sccache ~/.cache/obscura-v8-prebuilt ~/.cargo/bin ~/.cargo/registry/cache ~/.cargo/registry/index ~/.cargo/git/db
+          sudo chmod -R a+r /var/cache/apt/archives 2>/dev/null || true
 
       - name: Save cargo-ndk binary cache
         uses: actions/cache/save@v6.1.0
@@ -439,13 +483,6 @@ jobs:
           path: ~/.cache/obscura-v8-prebuilt
           key: v8-prebuilt-v150.4.0-aarch64-linux-android-r26d-v2
 
-      - name: Save sccache directory (Resume support on cancel or failure)
-        uses: actions/cache/save@v6.1.0
-        if: (cancelled() || failure()) && steps.package-v8.outputs.has_v8 != 'true'
-        with:
-          path: ~/.cache/sccache
-          key: sccache-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
-
       - name: Upload prebuilt V8 cache artifact
         if: steps.package-v8.outputs.has_v8 == 'true'
         uses: actions/upload-artifact@v7.0.2
@@ -454,6 +491,87 @@ jobs:
           path: ~/.cache/obscura-v8-prebuilt/
           if-no-files-found: ignore
           retention-days: 7
+
+      # ---------------- V8 Incremental Resume Checkpoint & Error ZIP (When Incomplete or Failed) ----------------
+      - name: Package V8 checkpoint and error logs into ZIP
+        id: package-v8-checkpoint
+        if: always() && steps.package-v8.outputs.has_v8 != 'true'
+        run: |
+          echo "📦 ========================================================"
+          echo "📦 Packaging V8 compilation checkpoint & error diagnostics"
+          echo "📦 ========================================================"
+          mkdir -p ~/.cache
+          CHECKPOINT_ZIP="$HOME/.cache/v8-resume-checkpoint.zip"
+          rm -f "$CHECKPOINT_ZIP"
+
+          # 1. Create clear error summary
+          echo "Obscura Android - V8 Compilation Diagnostic Report" > v8_error_summary.txt
+          echo "Generated at: $(date -u)" >> v8_error_summary.txt
+          echo "==================================================" >> v8_error_summary.txt
+          if [ -f "v8_build.log" ]; then
+            echo -e "\n--- Detected Errors / Failures ---" >> v8_error_summary.txt
+            grep -i -E "error:|FAILED:|fatal error:|undefined reference" v8_build.log | tail -n 120 >> v8_error_summary.txt || true
+            echo -e "\n--- Last 200 Lines of Build Log ---" >> v8_error_summary.txt
+            tail -n 200 v8_build.log >> v8_error_summary.txt || true
+            echo "📄 v8_error_summary.txt preview:"
+            cat v8_error_summary.txt | head -n 45 || true
+          else
+            echo "No v8_build.log found (compilation did not start or failed before logging)." >> v8_error_summary.txt
+          fi
+
+          # 2. Gather directories to save for resume
+          TARGET_V8_DIRS=$(find target/ -type d -name "v8-*" 2>/dev/null || true)
+          FP_DIRS=$(find target/ -type d -path "*/.fingerprint/v8-*" 2>/dev/null || true)
+
+          ZIP_INPUTS="v8_error_summary.txt"
+          [ -f "v8_build.log" ] && ZIP_INPUTS="$ZIP_INPUTS v8_build.log"
+          [ -n "$TARGET_V8_DIRS" ] && ZIP_INPUTS="$ZIP_INPUTS $TARGET_V8_DIRS"
+          [ -n "$FP_DIRS" ] && ZIP_INPUTS="$ZIP_INPUTS $FP_DIRS"
+
+          OBJ_COUNT=$(find target/ -name "*.o" 2>/dev/null | wc -l)
+          echo "Found $OBJ_COUNT compiled object files in target directories."
+
+          if [ -n "$ZIP_INPUTS" ]; then
+            echo "Creating $CHECKPOINT_ZIP with inputs: $ZIP_INPUTS"
+            zip -r -q "$CHECKPOINT_ZIP" $ZIP_INPUTS
+            echo "has_checkpoint=true" >> $GITHUB_OUTPUT
+            echo "✅ Checkpoint ZIP created successfully:"
+            ls -lh "$CHECKPOINT_ZIP"
+          else
+            echo "has_checkpoint=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No V8 build directories or logs to package into zip."
+          fi
+
+      - name: Upload V8 resume checkpoint & error ZIP artifact
+        if: always() && steps.package-v8-checkpoint.outputs.has_checkpoint == 'true' && steps.package-v8.outputs.has_v8 != 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: v8-resume-checkpoint-android
+          path: |
+            ~/.cache/v8-resume-checkpoint.zip
+            v8_error_summary.txt
+            v8_build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Save V8 incremental checkpoint cache (Resume support)
+        uses: actions/cache/save@v6.1.0
+        if: always() && steps.package-v8-checkpoint.outputs.has_checkpoint == 'true' && steps.package-v8.outputs.has_v8 != 'true'
+        with:
+          path: |
+            target/aarch64-linux-android/release/build/v8-*
+            target/release/build/v8-*
+            target/aarch64-linux-android/release/.fingerprint/v8-*
+            target/release/.fingerprint/v8-*
+            ~/.cache/v8-resume-checkpoint.zip
+          key: v8-checkpoint-aarch64-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save sccache directory (Compiler objects cache)
+        uses: actions/cache/save@v6.1.0
+        if: always()
+        with:
+          path: ~/.cache/sccache
+          key: sccache-android-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # ---------------- Caching Layer 7: Gradle Cache & Build APK ----------------
       - name: Set up Gradle
