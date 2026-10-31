@@ -1646,9 +1646,24 @@ impl Page {
         for _ in 0..queued {
             scripts_ran |= self.run_next_pending_frame().await;
         }
+        let navigated = self.advance_frame_navigations();
         let delivered = self.deliver_frame_messages();
         self.release_detached_frames();
-        queued_new || scripts_ran || delivered
+        queued_new || scripts_ran || delivered || navigated
+    }
+
+    fn advance_frame_navigations(&mut self) -> bool {
+        if self.frames.is_empty() { return false; }
+        let pending = match &self.js { Some(js) => js.take_pending_frame_navigations(), None => return false };
+        let changed = !pending.is_empty();
+        for (id, url, method, body) in pending {
+            let Some(frame) = self.frames.iter().find(|frame| frame.frame_id() == id) else { continue; };
+            let owner = frame.parent_frame_id();
+            let script = format!("(function(){{const frame=globalThis.__obscura_frameElements[{id}];                if(frame && frame._frameId==={id} && frame.isConnected) frame._loadIframeSrc({},{{method:{},body:{}}});}})()",
+                serde_json::to_string(&url).unwrap(), serde_json::to_string(&method).unwrap(), serde_json::to_string(&body).unwrap());
+            self.execute_frame_owner_script(owner, &script);
+        }
+        changed
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -7381,6 +7396,62 @@ mod tests {
             "https://assets.test/dir/", "https://assets.test/dir/next", "parent", "undefined",
             [["about:srcdoc", "yes", 42]], true, "CSS1Compat"]));
         assert_eq!(page.frame_urls(), vec!["about:srcdoc", "about:srcdoc"]);
+    }
+
+    /// A page script can call a frame's own Location methods (lazy-load
+    /// scripts do `iframe.contentWindow.location.replace(src)`). The running
+    /// context is then the page's, so the navigation was queued on the top
+    /// document, which loaded the iframe's URL in place of its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn frame_location_navigation_loads_the_child_and_ignores_detached_windows() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];socket.read(&mut request).unwrap();
+            let body = "<!doctype html><title>Child after</title><p>after</p>";
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut page = import_map_test_page("frame-location-commit", &base,
+            "<title>Parent</title><iframe srcdoc='<p>before</p>'></iframe>");
+        pump_srcdoc_frames(&mut page).await;
+        page.evaluate_script(&format!("document.querySelector('iframe').contentWindow.location.replace({});1",serde_json::to_string(&format!("{base}/after")).unwrap())).unwrap();
+        assert!(!page.has_pending_navigation());
+        for _ in 0..20 {
+            page.advance_frames().await;
+            if let Some(js)=page.js.as_mut() {js.run_event_loop_bounded(20).await.unwrap();}
+            if page.frame_urls().iter().any(|url|url.ends_with("/after")) { break; }
+        }
+        assert_eq!(page.frame_urls(),vec![format!("{base}/after")]);
+        assert_eq!(page.evaluate_in_frame(0,"document.body.textContent").unwrap(),serde_json::json!("after"));
+        assert_eq!(page.evaluate_script("document.title").unwrap(),serde_json::json!("Parent"));
+        page.evaluate_script("globalThis.stale=document.querySelector('iframe').contentWindow;document.querySelector('iframe').remove();1").unwrap();
+        page.advance_frames().await;
+        page.evaluate_script("stale.location.assign('https://other.test/');1").unwrap();
+        assert!(!page.has_pending_navigation(),"a discarded child cannot navigate the top document");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigating_a_frame_from_the_page_keeps_the_top_document() {
+        let mut page = import_map_test_page("frame-location-from-page", "https://parent.test",
+            "<title>Top document</title><body><iframe srcdoc='<form id=f action=/x></form>'></iframe></body>");
+        pump_srcdoc_frames(&mut page).await;
+        for call in [
+            "location.replace('https://embed.test/video')",
+            "location.assign('https://embed.test/video')",
+            "location.href = 'https://embed.test/video'",
+            "location.reload()",
+            "document.getElementById('f').submit()",
+        ] {
+            page.evaluate_script(&format!("document.querySelector('iframe').contentWindow.{call}; 1")).unwrap();
+            assert!(!page.has_pending_navigation(), "{call} queued a navigation on the top document");
+        }
+        assert_eq!(page.evaluate_script("[location.href, document.title]").unwrap(),
+            serde_json::json!(["https://parent.test/app/index.html", "Top document"]));
+        // The top document still navigates itself.
+        page.evaluate_script("location.href = 'https://other.test/'; 1").unwrap();
+        assert!(page.has_pending_navigation());
     }
 
     #[tokio::test(flavor = "current_thread")]
