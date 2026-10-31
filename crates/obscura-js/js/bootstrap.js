@@ -2351,12 +2351,11 @@ function __prepareInsertedSubtree(root) {
   if (!root || !root.isConnected) return;
   const scripts = [];
   const seen = new Set();
-  if (root.nodeType === 1 && (root.tagName === 'SCRIPT'
-      || (root.tagName === 'IFRAME' && root.hasAttribute('srcdoc')))) {
+  if (root.nodeType === 1 && (root.tagName === 'SCRIPT' || root.tagName === 'IFRAME')) {
     scripts.push(root);
     seen.add(root._nid);
   }
-  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe[srcdoc]") || [];
+  const ids = _domParse("query_selector_all_scoped", root._nid, "script,iframe") || [];
   for (const nid of ids) {
     const script = _wrapEl(+nid);
     if (script && !seen.has(script._nid)) {
@@ -2366,8 +2365,15 @@ function __prepareInsertedSubtree(root) {
   }
   for (const script of scripts) {
     if (_postConnection) _postConnection.cursor = script;
-    if (script.localName === 'iframe') script._loadIframeSrcdoc();
-    else __prepareInsertedScript(script);
+    if (script.localName === 'iframe') {
+      if (script.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
+      if (script.hasAttribute('srcdoc')) script._loadIframeSrcdoc();
+      else {
+        const src = script.getAttribute('src');
+        if (src && src !== 'about:blank') script._loadIframeSrc(src);
+        else if (_ensureInitialFrameRealm(script)) script.dispatchEvent(new Event('load'));
+      }
+    } else __prepareInsertedScript(script);
   }
 }
 
@@ -4190,7 +4196,7 @@ class Element extends Node {
     // before script can synchronously read `window.someId`.
     _registerWindowNamedTree(this);
     _reconcileWindowNamedProperties(previousWindowNames);
-    _connectSrcdocFrames(this, html);
+    _connectInsertedFrames(this, html);
     if (globalThis.__mutationObservers?.length) {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
@@ -7096,7 +7102,7 @@ class DocumentFragment extends Node {
     } else {
       _dom("set_inner_html", this._nid, html);
     }
-    _connectSrcdocFrames(this, html);
+    _connectInsertedFrames(this, html);
   }
   querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
   querySelectorAll(s) {
@@ -15486,9 +15492,9 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
-function _connectSrcdocFrames(root, html) {
+function _connectInsertedFrames(root, html) {
   if (root.isConnected && /<iframe[\s/>]/i.test(html)) {
-    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe[srcdoc]')));
+    _runPostConnectionSteps(Array.from(root.querySelectorAll('iframe')));
   }
 }
 
@@ -15533,6 +15539,16 @@ function _ensureInitialFrameRealm(element, srcdoc) {
     element._iframeDoc = opaque ? null
       : globalThis.__obscura_frameObjects[frameId].document;
     globalThis.__obscura_frameElements[frameId] = element;
+    if (srcdoc === undefined && !opaque) {
+      const evaluate = element._iframeWin.eval;
+      const initializeFrames = element._iframeWin.__obscura_init_frames;
+      const sources = JSON.parse(__obscuraCore.ops.op_frame_preload_scripts());
+      for (const source of sources) {
+        try { evaluate(source); }
+        catch (error) { console.error('Frame preload failed:', error && error.message || error); }
+      }
+      if (sources.length) initializeFrames();
+    }
   }
   return frameId !== 0;
 }
@@ -18426,6 +18442,22 @@ const _documentMembers = Object.freeze(Object.fromEntries([
   ['elementStyle', function() { return _elementStyle(this); }],
 ]));
 
+globalThis.__obscura_init_frames = function() {
+  // A parser-created <iframe src> never went through the src setter, so
+  // nothing had started its load and the frame stayed empty (issue #600).
+  // This also runs inside a frame realm, so a frame nested in a frame loads
+  // by the same path, with op_frame_document_ready recording the caller as
+  // its parent.
+  for (const frame of globalThis.document.querySelectorAll('iframe')) {
+    if (frame.namespaceURI !== 'http://www.w3.org/1999/xhtml') continue;
+    const src = frame.getAttribute('src');
+    if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
+    else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
+    else if (_ensureInitialFrameRealm(frame)) frame.dispatchEvent(new Event('load'));
+  }
+
+};
+
 globalThis.__obscura_init = (function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
@@ -18513,16 +18545,7 @@ globalThis.__obscura_init = (function() {
   // wrongly changes everything after it.
   _installFramingRelationships();
 
-  // A parser-created <iframe src> never went through the src setter, so
-  // nothing had started its load and the frame stayed empty (issue #600).
-  // This also runs inside a frame realm, so a frame nested in a frame loads
-  // by the same path, with op_frame_document_ready recording the caller as
-  // its parent.
-  for (const frame of globalThis.document.querySelectorAll('iframe')) {
-    const src = frame.getAttribute('src');
-    if (frame.hasAttribute('srcdoc')) frame._loadIframeSrcdoc();
-    else if (src && src !== 'about:blank') frame._loadIframeSrc(src);
-  }
+  if (JSON.parse(__obscuraCore.ops.op_frame_preload_scripts()).length === 0) globalThis.__obscura_init_frames();
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

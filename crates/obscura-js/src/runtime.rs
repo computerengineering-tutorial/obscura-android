@@ -2580,13 +2580,19 @@ impl ObscuraJsRuntime {
             .has_live_image_outcome(url, profile)
     }
 
+    #[doc(hidden)]
+    pub fn set_frame_preload_scripts(&self, scripts: &[String]) {
+        self.realm_states().borrow_mut().frame_preload_scripts = scripts.to_vec();
+    }
+
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
         self.state.borrow_mut().navigation_timing.record("domLoading");
-        let _ = self.execute_runtime_script(
+        let _ = self.execute_script_with_timeout(
             "<obscura:page-init>",
-            "globalThis.__obscura_init();".to_string(),
+            "globalThis.__obscura_init();",
+            std::time::Duration::from_secs(5),
         );
     }
 
@@ -3766,8 +3772,8 @@ impl ObscuraJsRuntime {
             return Err("JavaScript heap limit exceeded; execution terminated".into());
         }
 
-        // Publish settled protocol replies before parking on unrelated page work.
-        if self.has_ready_cdp_evaluations() { return Ok(false); }
+        // Let the page adopt frame documents and deliver messages before parking.
+        if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() { return Ok(false); }
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
@@ -3787,7 +3793,7 @@ impl ObscuraJsRuntime {
                     "autonomous browser task exceeded its task budget".into(),
                 ));
             }
-            if self.has_ready_cdp_evaluations() {
+            if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
                 return std::task::Poll::Ready(Ok(false));
             }
             match tick {

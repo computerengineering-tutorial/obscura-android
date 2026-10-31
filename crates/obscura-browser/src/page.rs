@@ -1280,9 +1280,17 @@ impl Page {
                 // New-document scripts must be installed before the published
                 // child context can be observed, including while its external
                 // scripts are still loading.
-                for source in &self.preload_scripts {
-                    if let Err(error) = realm.execute_script(js, source) {
-                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                if frame.url != "about:blank" {
+                    for source in &self.preload_scripts {
+                        if let Err(error) = realm.execute_script(js, source) {
+                            tracing::debug!("frame {} preload failed: {error}", frame.url);
+                        }
+                    }
+                    if !self.preload_scripts.is_empty() {
+                        let watchdog = js.arm_watchdog(std::time::Duration::from_secs(5));
+                        let result = realm.execute_script(js, "globalThis.__obscura_init_frames();");
+                        js.disarm_watchdog(watchdog);
+                        if let Err(error) = result { tracing::debug!("frame initialization failed: {error}"); }
                     }
                 }
             }
@@ -1367,22 +1375,25 @@ impl Page {
             self.pending_frame_work.pop_front();
             return true;
         };
-        if let Some(js) = self.js.as_mut() {
-            for problem in self.frames[index]
-                .run_document_scripts(js, |url| sources.get(url).cloned())
-            {
-                tracing::debug!("frame {}: {}", frame_url, problem);
+        // Initial blank documents finish synchronously during insertion.
+        if frame_url != "about:blank" {
+            if let Some(js) = self.js.as_mut() {
+                for problem in self.frames[index]
+                    .run_document_scripts(js, |url| sources.get(url).cloned())
+                {
+                    tracing::debug!("frame {}: {}", frame_url, problem);
+                }
+                if let Err(error) = self.frames[index].dispatch_load_events(js) {
+                    tracing::debug!("frame {} load events failed: {error}", frame_url);
+                }
             }
-            if let Err(error) = self.frames[index].dispatch_load_events(js) {
-                tracing::debug!("frame {} load events failed: {error}", frame_url);
-            }
+            self.execute_frame_owner_script(parent_frame_id, &format!(
+                "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
+                 if (frame && frame.isConnected && frame._frameId === {frame_id}) \
+                   frame.dispatchEvent(new Event('load')); }})()"
+            ));
         }
         self.pending_frame_work.pop_front();
-        self.execute_frame_owner_script(parent_frame_id, &format!(
-            "(function(){{ const frame = globalThis.__obscura_frameElements[{frame_id}]; \
-             if (frame && frame.isConnected && frame._frameId === {frame_id}) \
-               frame.dispatchEvent(new Event('load')); }})()"
-        ));
         true
     }
 
@@ -1914,6 +1925,7 @@ impl Page {
         }
 
         rt.set_navigation_timing(self.navigation_timing.clone());
+        rt.set_frame_preload_scripts(&self.preload_scripts);
         rt.run_page_init();
         rt.set_media_preferences(self.reduced_motion, self.dark_color_scheme);
         let _ = rt.execute_script(
@@ -2581,6 +2593,10 @@ impl Page {
                 if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
                     tracing::debug!("Preload script error: {}", e);
                 }
+            }
+            if !preload_sources.is_empty() {
+                let _ = js.execute_script_with_timeout("<frame-init>", "globalThis.__obscura_init_frames();",
+                    std::time::Duration::from_secs(5));
             }
         }
 
@@ -3480,6 +3496,10 @@ impl Page {
                     if let Err(e) = js.execute_script_guarded("<preload>", source.as_str()) {
                         tracing::debug!("Preload script error on about:blank: {}", e);
                     }
+                }
+                if !preload_sources.is_empty() {
+                    let _ = js.execute_script_with_timeout("<frame-init>", "globalThis.__obscura_init_frames();",
+                        std::time::Duration::from_secs(5));
                 }
             }
             return Ok(());
@@ -4914,6 +4934,7 @@ impl Page {
     }
 
     pub fn set_preload_scripts(&mut self, scripts: Vec<String>) {
+        if let Some(js) = &self.js { js.set_frame_preload_scripts(&scripts); }
         self.preload_scripts = scripts;
     }
 
@@ -7254,6 +7275,81 @@ mod tests {
             try { readable = !!frame.contentWindow.document?.body; } catch (_) {}
             return [document.title, frame.contentDocument === null, readable];
         })()"#).unwrap(), serde_json::json!(["Top document", true, false]));
+    }
+
+    #[test]
+    fn foreign_iframe_elements_do_not_create_browsing_contexts() {
+        let mut page = import_map_test_page("foreign-frame", "https://parent.test",
+            "<body><svg><iframe id='foreign'></iframe></svg></body>");
+        assert!(!page.js.as_ref().unwrap().has_pending_frame_tasks(), "parser-created SVG iframe");
+        page.evaluate_script(r#"(() => {
+            const root = document.createElement('div');
+            root.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'iframe'));
+            document.body.appendChild(root);
+            root.innerHTML = '<svg><iframe></iframe></svg>';
+            return true;
+        })()"#).unwrap();
+        assert!(!page.js.as_ref().unwrap().has_pending_frame_tasks(), "inserted SVG iframe");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_iframe_load_runs_while_an_unrelated_timer_is_pending() {
+        for inserted in [false, true] {
+            let html = if inserted { "<body></body>" } else {
+                "<body><iframe id='f' onload='globalThis.loads = (globalThis.loads || 0) + 1'></iframe></body>"
+            };
+            let mut page = import_map_test_page("blank-frame-load", "https://parent.test", html);
+            page.set_preload_scripts(vec!["globalThis.eval = () => undefined;".into(),
+            "globalThis.preloadCount = (globalThis.preloadCount || 0) + 1;".into()]);
+            page.evaluate_script(&format!(r#"(() => {{
+                globalThis.loads = globalThis.loads || 0;
+                if ({inserted}) {{
+                    const frame = document.createElement('iframe');
+                    frame.id = 'f'; frame.onload = () => loads++;
+                    document.body.appendChild(frame);
+                }}
+                setTimeout(() => {{}}, 60000);
+                return true;
+            }})()"#)).unwrap();
+            assert_eq!(page.evaluate_script("loads").unwrap().as_f64(), Some(1.0),
+                "initial blank load must fire during insertion, without getters");
+            tokio::time::timeout(std::time::Duration::from_secs(2),
+                page.run_autonomous_event_loop_turn()).await
+                .expect("frame adoption must not wait for an unrelated timer").unwrap();
+            assert_eq!(page.frame_urls(), ["about:blank"]);
+            assert_eq!(page.evaluate_script("[document.getElementById('f').contentDocument.URL, loads]").unwrap(),
+                serde_json::json!(["about:blank", 1]));
+            if inserted {
+                assert_eq!(page.evaluate_script("document.getElementById('f').contentWindow.preloadCount").unwrap().as_f64(),
+                    Some(1.0), "initial-frame preloads run once");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_blank_iframe_load_runs_after_parent_initialization_scripts() {
+        let mut page = import_map_test_page("parser-frame-order", "https://parent.test", "<body></body>");
+        page.set_preload_scripts(vec!["globalThis.preloadMarker = 'ready';".into()]);
+        page.navigate("data:text/html,<body><iframe onload='globalThis.observed = [window.preloadMarker, this.contentWindow.preloadMarker]'></iframe></body>").await.unwrap();
+        assert_eq!(page.evaluate_script("observed").unwrap(), serde_json::json!(["ready", "ready"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_iframe_load_observes_preloads_and_precedes_append_return() {
+        let mut page = import_map_test_page("blank-frame-order", "https://parent.test", "<body></body>");
+        page.set_preload_scripts(vec!["globalThis.preloadCount = (globalThis.preloadCount || 0) + 1;".into()]);
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const events = []; const frame = document.createElement('iframe');
+            frame.onload = () => events.push(['load', frame.contentDocument.readyState, frame.contentWindow.preloadCount]);
+            document.body.appendChild(frame); events.push(['after']);
+            return events;
+        })()"#).unwrap(), serde_json::json!([["load", "complete", 1], ["after"]]));
+        page.set_preload_scripts(vec!["globalThis.preloadCount = 7;".into()]);
+        assert_eq!(page.evaluate_script(r#"(() => {
+            const parent = document.querySelector('iframe').contentDocument;
+            const nested = parent.createElement('iframe'); parent.body.appendChild(nested);
+            return nested.contentWindow.preloadCount;
+        })()"#).unwrap().as_f64(), Some(7.0), "existing parent frames see updated initialization scripts");
     }
 
     #[tokio::test(flavor = "current_thread")]

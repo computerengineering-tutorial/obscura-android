@@ -1116,6 +1116,7 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
+    pub(crate) frame_preload_scripts: Vec<String>,
 }
 
 struct FrameTimers {
@@ -7765,6 +7766,18 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+#[op2]
+#[string]
+fn op_frame_preload_scripts(state: &OpState) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        serde_json::to_string(&registry.borrow().frame_preload_scripts).unwrap_or("[]".into())
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_preload_scripts panicked; returning no scripts");
+        "[]".into()
+    })
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -7855,6 +7868,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    ops.push(op_frame_preload_scripts());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
