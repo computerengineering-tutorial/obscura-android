@@ -1196,6 +1196,12 @@ impl ObscuraJsRuntime {
     pub fn has_pending_frame_tasks(&self) -> bool {
         let state = self.state.borrow();
         !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
+            || self.realm_states().borrow().has_pending_navigation()
+    }
+
+    #[doc(hidden)]
+    pub fn take_pending_frame_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.realm_states().borrow().take_pending_navigations()
     }
 
     /// postMessage traffic waiting to be delivered to another realm.
